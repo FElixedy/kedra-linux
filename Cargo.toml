@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+# lsm-helper (privileged actions) and lsm-gui (GTK4) are added as they land;
+# the workspace only lists crates that actually build.
+members = ["crates/lsm-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/uras/linux-system-manager"
+authors = ["Linux System Manager contributors"]
+
+[workspace.dependencies]
+lsm-core = { path = "crates/lsm-core" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "serde_json"] }
+sha2 = "0.10"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+walkdir = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
