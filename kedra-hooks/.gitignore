@@ -1,0 +1,9 @@
+git_clean.sh
+git_push.sh
+git_setup.sh
+.directory
+# build artifacts
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig

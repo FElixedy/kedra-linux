@@ -1,0 +1,32 @@
+# Kedra Experience preset: vanilla
+#
+# Vanilla is NOT "Kedra with every module toggled off".
+#
+# `applies_experience_layer = false` means the Experience layer is never
+# applied in the first place: no module is read, no configuration is written,
+# and consequently nothing has to be reverted. Tooling must short-circuit on
+# this flag BEFORE consulting `modules`, so that a future Kedra default can
+# never be applied and then undone on a Vanilla system.
+#
+# The validator enforces that `modules` is empty whenever this flag is false,
+# so the "apply then revert" shape cannot be expressed here by accident.
+
+schema_version = 6
+
+[preset]
+id = "vanilla"
+name = "Vanilla GNOME"
+description = "Upstream GNOME as GNOME ships it. The Kedra user experience layer is not applied."
+version = "0.1.0"
+
+# base    — self-contained, inherits from nothing
+# derived — inherits from `base_preset` and records only overrides
+kind = "base"
+
+user_selectable = true
+
+# The defining property of this preset.
+applies_experience_layer = false
+
+# Deliberately empty, and required to stay empty while the flag above is false.
+modules = []

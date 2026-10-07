@@ -1,0 +1,43 @@
+##
+## The [kedra] section, and where it belongs in /etc/pacman.conf.
+##
+## ORDERING
+## --------
+## Pacman resolves a package name from the FIRST repository listed that
+## contains it, so repository order is the mechanism by which Kedra takes
+## ownership of a name. [kedra] therefore goes above every CachyOS and Arch
+## repository:
+##
+##     [kedra]                     <- Kedra-owned and Kedra-replacement packages
+##     [cachyos-znver4]            <- CachyOS optimised repos (v3/v4/znver4),
+##     [cachyos-core-znver4]          present only on capable hardware
+##     [cachyos-extra-znver4]
+##     [cachyos]                   <- CachyOS packages, kernels, tooling
+##     [core]                      <- Arch
+##     [extra]
+##     [multilib]
+##
+## This is the ordering that lets kedra-hooks replace cachyos-hooks while
+## CachyOS keeps providing kernels and optimised builds.
+##
+## The obvious hazard of top priority is that any name published to [kedra]
+## silently overrides the Arch/CachyOS build of that name. That hazard is
+## contained OUTSIDE pacman, by policy: kedra-repo-publish refuses to add a
+## package whose pkgname is not in config/kedra-repo-packages.txt. Keep the
+## allowlist short and [kedra] can sit first safely.
+##
+## SIGNATURES
+## ----------
+## `Required` makes a valid, trusted package signature mandatory -- Kedra never
+## relies on SigLevel = Never.
+##
+## `DatabaseOptional` matches Arch and CachyOS. kedra-repo-publish does sign
+## kedra.db, and DatabaseOptional still verifies a signature that is present;
+## it only tolerates its absence. It can be tightened to DatabaseRequired once
+## every Kedra system is guaranteed to have kedra-keyring installed before its
+## first `pacman -Sy`.
+##
+
+[kedra]
+SigLevel = Required DatabaseOptional
+Include = /etc/pacman.d/kedra-mirrorlist

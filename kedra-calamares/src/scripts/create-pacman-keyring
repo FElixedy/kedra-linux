@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Establish the LIVE system's package trust, which shellprocess_initialize_pacman
+# then copies wholesale into the target as ${ROOT}/etc/pacman.d/gnupg.
+#
+# Redirect standard error to standard output since calamares doesn't
+# capture stderr
+exec 2>&1
+
+pacman-key --init
+
+# KEDRA: populate BEFORE the first `pacman -Sy`.
+#
+# Upstream's order is --init, then -Sy the keyring packages, then --populate. That
+# assumes the sync can happen without trust, which stops being true the moment a
+# SIGNED repository database is in the configuration: [kedra] ships a signed
+# kedra.db, and `DatabaseOptional` only tolerates a MISSING signature -- it still
+# verifies one that is present. An unpopulated keyring therefore aborts the sync
+# with `key "..." is unknown` before any keyring package can be installed.
+#
+# This is the same ordering bug the ISO workstream already fixed in
+# calamares-online.sh. It is fixed here too rather than relied upon there: this
+# script is the installer's own trust bootstrap and has to be correct on its own,
+# including when it is re-run or when the live keyring was reset in between.
+#
+# `--populate` with no argument loads every keyring in /usr/share/pacman/keyrings,
+# so Arch, CachyOS and Kedra trust are all established without naming them.
+pacman-key --populate
+
+# Update cachyos-keyring first since archlinux-keyring is taken from cachyos
+# repo. Also try to make multiple attempts in case of failures due to unsynced
+# mirrors.
+for ((i=0; i<5; i++)); do pacman -Sy --noconfirm --needed cachyos-keyring && break; done
+for ((i=0; i<5; i++)); do pacman -Sy --noconfirm --needed archlinux-keyring && break; done
+# KEDRA: kedra-keyring is refreshed alongside them for the same reason -- the
+# copy on the live medium may be older than the one in [kedra], and the target
+# inherits whatever trust this step ends with.
+for ((i=0; i<5; i++)); do pacman -Sy --noconfirm --needed kedra-keyring && break; done
+
+# Re-populate so keys added by the refreshed keyring packages are trusted too.
+pacman-key --populate
+
+# KEDRA: fail loudly if Kedra trust was not established. Everything downstream --
+# pacstrap resolving kedra-hooks, and the target keyring, which is a copy of this
+# one -- depends on it, and without this check the failure surfaces much later as
+# an unexplained pacstrap error.
+if ! pacman-key --list-keys 631030A438B1A866278D8C2D1E9618DF1CE116BC >/dev/null 2>&1; then
+	echo "==> ERROR: the live keyring does not trust the Kedra signing key."
+	echo "==> Is kedra-keyring installed on this medium?"
+	exit 1
+fi
+echo "==> live keyring trusts Arch, CachyOS and Kedra"

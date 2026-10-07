@@ -1,0 +1,42 @@
+# Kedra Experience module: extras
+#
+# ARCHITECTURE DEFINITION ONLY.
+#
+# `extras` exists to prove that a module can be declared, shipped and
+# discoverable while being activated by no preset. It is the reference case for
+# "available but off by default" — see presets/kedra.toml.
+
+schema_version = 6
+
+[module]
+id = "extras"
+name = "Kedra Extras"
+description = "Opt-in additions outside the default Kedra experience."
+# Bumped for the schema 3 settings/migrations record format.
+version = "0.3.0"
+tier = "optional"
+user_selectable = true
+introduced_in = "0.1.0"
+
+# No relationship to `desktop`. `extras` declares no settings at all; its one
+# relationship is to `appearance`, and that is already expressed precisely -- and
+# more usefully -- as a conditional *package* relation below, which pulls
+# gnome-tweaks in only when appearance actually resolves to enabled. Adding an
+# advisory edge saying the same thing again would be duplication, not clarity.
+requires = []
+conflicts = []
+
+# Setting declarations (schema 3). Empty: no real GNOME values ship yet.
+settings = []
+
+# Migration records (schema 3). Empty until a setting evolves.
+migrations = []
+
+# The second condition type: a relationship that depends on another module's
+# resolved state rather than on what is installed. The referenced module ID is
+# cross-checked against the tree by the validator.
+[[module.packages]]
+name = "gnome-tweaks"
+relation = "conditional"
+condition = { type = "module-enabled", module = "appearance" }
+reason = "Only surfaces settings worth exposing when the appearance layer is active."

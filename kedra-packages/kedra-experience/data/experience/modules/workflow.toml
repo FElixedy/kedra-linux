@@ -1,0 +1,289 @@
+# Kedra Experience module: workflow
+#
+# Kedra Workflow v1 -- the first module that declares real, user-visible GNOME
+# behaviour.
+#
+# Every setting below is `policy = "default"`. None of them is written to any
+# user's dconf. They are rendered into a GSettings vendor override installed by
+# `kedra-experience-workflow`, so:
+#
+#   * an explicit user value always wins, and always survives a Kedra update;
+#   * a Vanilla system, which does not install that package, gets none of them;
+#   * removing the package restores upstream GNOME defaults, with no revert
+#     step and nothing left behind in dconf.
+#
+# The keymap, the displaced GNOME defaults and why Super+Enter belongs to the
+# terminal module are documented in docs/kedra-workflow.md. Schema and key names were read from the
+# installed GNOME 50 schemas, not assumed.
+
+schema_version = 6
+
+[module]
+id = "workflow"
+name = "Kedra Workflow"
+description = "Kedra's keyboard-driven workflow layer: shortcut scheme, workspace switching and window placement conventions."
+# Bumped for Kedra Workflow v1: the first real setting declarations.
+version = "0.3.0"
+tier = "recommended"
+user_selectable = true
+introduced_in = "0.1.0"
+
+# No hard requirement. The keybindings below are ordinary GSettings defaults in
+# schemas mutter and GNOME Shell install; none of them reads, writes or depends
+# on anything the `desktop` module declares. Super+Q, Super+1..5 and
+# Super+Shift+1..5 are registered and functional whether or not Kedra Desktop is
+# enabled.
+requires = []
+conflicts = []
+
+# Migration records (schema 3). Empty: v1 is the first version with settings,
+# so no declaration has moved, been renamed or been withdrawn yet.
+migrations = []
+
+# Advisory relationship (schema 4), and this is the pairing the standard Kedra
+# preset exists to make: the numeric keys are designed around Kedra Desktop's
+# fixed five-workspace model. Separating them is a supported Custom Kedra
+# choice, not a broken profile -- so it earns a warning, never an error, and
+# never re-enables `desktop` behind the user.
+#
+# Declared after every bare [module] key on purpose: this opens a sub-table, and
+# anything written below it would land inside that table rather than in [module].
+[[module.works_best_with]]
+id = "desktop"
+reason = "without the Kedra fixed five-workspace model, GNOME manages workspaces dynamically and Super+1..5 do nothing for workspaces that do not currently exist"
+
+
+# ---------------------------------------------------------------------------
+# Close the active window
+# ---------------------------------------------------------------------------
+#
+# Upstream default is ['<Alt>F4'], which Kedra keeps. Adding Super+Q rather than
+# replacing Alt+F4 displaces nothing: Alt+F4 is a cross-desktop convention and
+# every application help page in existence still names it. The first entry is
+# what GNOME Settings shows as the shortcut, so Super+Q remains the one Kedra
+# presents.
+
+[[module.settings]]
+id = "workflow-close-window"
+backend = "gsettings"
+policy = "default"
+description = "Close the active window with Super+Q, keeping the upstream Alt+F4."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "close" }
+value = { type = "as", data = ["<Super>q", "<Alt>F4"] }
+
+
+# ---------------------------------------------------------------------------
+# Switch to workspace 1..5
+# ---------------------------------------------------------------------------
+#
+# Upstream binds only switch-to-workspace-1, to <Super>Home; 2..5 ship unbound.
+# Kedra keeps <Super>Home on workspace 1 for the same reason it keeps Alt+F4.
+#
+# Super+1..5 is not free: GNOME binds it to org.gnome.shell.keybindings
+# switch-to-application-1..5. Those five are explicitly cleared at the bottom of
+# this manifest -- through this same vendor-default layer, so the displacement
+# is declared rather than left as two actions racing for one combination.
+
+[[module.settings]]
+id = "workflow-switch-workspace-1"
+backend = "gsettings"
+policy = "default"
+description = "Switch to workspace 1 with Super+1, keeping the upstream Super+Home."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "switch-to-workspace-1" }
+value = { type = "as", data = ["<Super>1", "<Super>Home"] }
+
+[[module.settings]]
+id = "workflow-switch-workspace-2"
+backend = "gsettings"
+policy = "default"
+description = "Switch to workspace 2 with Super+2."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "switch-to-workspace-2" }
+value = { type = "as", data = ["<Super>2"] }
+
+[[module.settings]]
+id = "workflow-switch-workspace-3"
+backend = "gsettings"
+policy = "default"
+description = "Switch to workspace 3 with Super+3."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "switch-to-workspace-3" }
+value = { type = "as", data = ["<Super>3"] }
+
+[[module.settings]]
+id = "workflow-switch-workspace-4"
+backend = "gsettings"
+policy = "default"
+description = "Switch to workspace 4 with Super+4."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "switch-to-workspace-4" }
+value = { type = "as", data = ["<Super>4"] }
+
+[[module.settings]]
+id = "workflow-switch-workspace-5"
+backend = "gsettings"
+policy = "default"
+description = "Switch to workspace 5 with Super+5."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "switch-to-workspace-5" }
+value = { type = "as", data = ["<Super>5"] }
+
+
+# ---------------------------------------------------------------------------
+# Move the active window to workspace 1..5
+# ---------------------------------------------------------------------------
+#
+# Upstream binds only move-to-workspace-1, to <Super><Shift>Home; 2..5 ship
+# unbound. Kedra keeps that binding, respelled <Shift><Super>Home to match the
+# ordering GNOME Settings writes. Mutter's parser is modifier-order-insensitive,
+# so this is the same combination, not a second one.
+#
+# Shift+Super+1..5 carries no GNOME default, so nothing is displaced here.
+
+[[module.settings]]
+id = "workflow-move-workspace-1"
+backend = "gsettings"
+policy = "default"
+description = "Move the active window to workspace 1 with Super+Shift+1, keeping the upstream Super+Shift+Home."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "move-to-workspace-1" }
+value = { type = "as", data = ["<Shift><Super>1", "<Shift><Super>Home"] }
+
+[[module.settings]]
+id = "workflow-move-workspace-2"
+backend = "gsettings"
+policy = "default"
+description = "Move the active window to workspace 2 with Super+Shift+2."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "move-to-workspace-2" }
+value = { type = "as", data = ["<Shift><Super>2"] }
+
+[[module.settings]]
+id = "workflow-move-workspace-3"
+backend = "gsettings"
+policy = "default"
+description = "Move the active window to workspace 3 with Super+Shift+3."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "move-to-workspace-3" }
+value = { type = "as", data = ["<Shift><Super>3"] }
+
+[[module.settings]]
+id = "workflow-move-workspace-4"
+backend = "gsettings"
+policy = "default"
+description = "Move the active window to workspace 4 with Super+Shift+4."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "move-to-workspace-4" }
+value = { type = "as", data = ["<Shift><Super>4"] }
+
+[[module.settings]]
+id = "workflow-move-workspace-5"
+backend = "gsettings"
+policy = "default"
+description = "Move the active window to workspace 5 with Super+Shift+5."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.keybindings", key = "move-to-workspace-5" }
+value = { type = "as", data = ["<Shift><Super>5"] }
+
+
+# ---------------------------------------------------------------------------
+# Displaced GNOME defaults
+# ---------------------------------------------------------------------------
+#
+# GNOME binds Super+1..9 to "activate the Nth pinned application". Kedra claims
+# Super+1..5 for workspace switching, so those five must be released or the same
+# combination would be claimed by two actions at once. GNOME resolves such a
+# clash by whichever grab it registers, which is not a behaviour to ship.
+#
+# The clearing is declared here, in the same layer and by the same mechanism as
+# the bindings that caused it, so a reader of this manifest sees the cost of the
+# keymap and `pacman -R kedra-experience-workflow` undoes both halves together.
+#
+# Only 1..5 are cleared. Super+6..9 keep switch-to-application-6..9, because
+# Kedra Workflow v1 claims five workspaces and taking more than it uses would be
+# gratuitous. The tradeoff -- Super+1..5 and Super+6..9 doing unrelated things
+# -- is stated in docs/kedra-workflow.md.
+
+[[module.settings]]
+id = "workflow-unbind-app-switch-1"
+backend = "gsettings"
+policy = "default"
+description = "Release Super+1 from GNOME's switch-to-application-1, which Kedra gives to workspace 1."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.shell.keybindings", key = "switch-to-application-1" }
+value = { type = "as", data = [] }
+
+[[module.settings]]
+id = "workflow-unbind-app-switch-2"
+backend = "gsettings"
+policy = "default"
+description = "Release Super+2 from GNOME's switch-to-application-2, which Kedra gives to workspace 2."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.shell.keybindings", key = "switch-to-application-2" }
+value = { type = "as", data = [] }
+
+[[module.settings]]
+id = "workflow-unbind-app-switch-3"
+backend = "gsettings"
+policy = "default"
+description = "Release Super+3 from GNOME's switch-to-application-3, which Kedra gives to workspace 3."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.shell.keybindings", key = "switch-to-application-3" }
+value = { type = "as", data = [] }
+
+[[module.settings]]
+id = "workflow-unbind-app-switch-4"
+backend = "gsettings"
+policy = "default"
+description = "Release Super+4 from GNOME's switch-to-application-4, which Kedra gives to workspace 4."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.shell.keybindings", key = "switch-to-application-4" }
+value = { type = "as", data = [] }
+
+[[module.settings]]
+id = "workflow-unbind-app-switch-5"
+backend = "gsettings"
+policy = "default"
+description = "Release Super+5 from GNOME's switch-to-application-5, which Kedra gives to workspace 5."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.shell.keybindings", key = "switch-to-application-5" }
+value = { type = "as", data = [] }
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+
+[[module.packages]]
+name = "gnome-shell"
+relation = "required"
+reason = "Shortcut scheme targets GNOME Shell and mutter keybinding schemas."
+
+# The delivery mechanism for every declaration above. This relation is what
+# makes the module's defaults conditional on the profile: Vanilla enables no
+# module and therefore requires no such package, and a Custom Kedra with
+# workflow disabled drops the requirement rather than installing the package and
+# reverting its effects.
+[[module.packages]]
+name = "kedra-experience-workflow"
+relation = "required"
+reason = "Installs the GSettings vendor override rendered from this module's policy 'default' settings."
+
+# Super+Enter is NOT declared here, and never will be. It is shipped by the
+# `terminal` module, which owns the terminal application contract it launches.
+# Workflow owns the window and workspace keyboard model; "open a terminal" is a
+# Terminal-module shortcut that happens to be a key combination.
+#
+# It is also a different *kind* of thing from everything above. GNOME 50 has no
+# native terminal-launch keybinding key -- org.gnome.desktop.default-applications.terminal
+# exists but is marked "DEPRECATED: This key is deprecated and ignored" -- so it
+# has to be a custom keybinding: a relocatable schema instance at a per-shortcut
+# dconf path, plus that path's membership of a list. None of that can be a
+# vendor default, so it is Kedra's only `policy = "managed"` setting and the one
+# value Kedra writes into a user's dconf.
+#
+# Nothing in this module is involved. Super+Enter needs no workflow package and
+# works with this module switched off entirely. See
+# docs/kedra-terminal.md#superenter.

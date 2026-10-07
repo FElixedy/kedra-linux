@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+#
+# kedra-repo-publish -- sign packages and publish them into the [kedra] repo.
+#
+#   kedra-repo-publish PKGFILE...
+#
+# Pipeline:
+#   package files -> allowlist check -> BATCH identity check -> IMMUTABILITY
+#                 check against what is already published -> detach signature
+#                 -> copy into docroot under the CANONICAL name -> repo-add
+#                    (which also signs the database) -> done
+#
+# The output tree is exactly what will later be served over HTTPS; publishing
+# to a real host becomes an rsync of $KEDRA_REPO_ROOT and nothing else changes.
+#
+# IMMUTABLE PACKAGE IDENTITY
+# --------------------------
+# A published artifact never changes. Its identity is what pacman uses --
+# pkgname, full pkgver (epoch:version-pkgrel) and arch, all read from .PKGINFO
+# rather than parsed out of a filename -- and once that identity is in the
+# docroot the bytes behind it are fixed forever.
+#
+# This matters because a Kedra system that has already synced kedra.db has
+# cached the old artifact's checksum. Replacing the bytes under an unchanged
+# version does not produce an upgrade; it produces a checksum mismatch on some
+# machines, a stale package on others, and a repository nobody can reason
+# about. It also breaks every provenance record that names a version --
+# kedra-iso's baseline manifest, most of all.
+#
+# So publishing an identity that already exists takes one of exactly two paths:
+#
+#   same identity, identical bytes    a no-op. Nothing is copied, nothing is
+#                                     re-signed, kedra.db is not rewritten, and
+#                                     the artifact keeps the signature it was
+#                                     published with. Re-running a publish is
+#                                     therefore always safe and always inert.
+#
+#   same identity, different bytes    a hard failure, BEFORE anything in the
+#                                     served tree is touched. The fix is a
+#                                     pkgrel bump, never an overwrite.
+#
+# THE RULE HOLDS INSIDE A SINGLE INVOCATION TOO
+# ---------------------------------------------
+# Checking each input only against what is already published leaves one hole
+# wide open: two inputs of the SAME invocation can carry the same identity and
+# different bytes, and neither of them is published yet, so neither sees the
+# other. Both would then reach the mutation phase, the second overwriting the
+# first inside one repo-add -- an overwrite by a different route.
+#
+# The whole batch is therefore reconciled against itself FIRST, by identity:
+#
+#   same identity, identical bytes    one logical input. Signed, copied and
+#                                     indexed exactly once, however many times
+#                                     it was named on the command line.
+#
+#   same identity, different bytes    the entire batch is refused before any
+#                                     artifact, signature, kedra.db or
+#                                     kedra.files is touched -- including the
+#                                     members that were perfectly fine.
+#
+# IDENTITY IS NEVER READ FROM A FILENAME -- ON EITHER SIDE
+# --------------------------------------------------------
+# Inputs are identified by their .PKGINFO, and so are the artifacts ALREADY in
+# the docroot. Discovering what is published by globbing name-version-arch would
+# mean a published artifact that someone renamed is invisible to the immutability
+# check, and different bytes could then be published under the same identity.
+# So the docroot is indexed by reading each artifact's own metadata.
+#
+# For the same reason the destination name is not the input's name: it is the
+# canonical pacman filename computed from .PKGINFO plus the container format
+# read from the file's magic bytes, i.e.
+#
+#   ${pkgname}-${epoch:pkgver-pkgrel}-${arch}.pkg.tar.${compression}
+#
+# which is exactly what makepkg would have produced. An input under any other
+# name is normalised onto it (loudly), so a rename can never become a second
+# permanent filename for one identity.
+#
+# There is deliberately NO --force, and no repair behaviour of any kind. A
+# corrupt repository -- a missing signature, a database that lost an entry -- is
+# reported and left alone, because repair is not publication and must not share a
+# code path with it. Fixing one means `gpg --detach-sign` or `repo-add` by hand,
+# which is deliberately more work than typing a flag.
+#
+# Note that "present in the docroot but not named by kedra.db" is the NORMAL
+# state of every superseded release, since the docroot is append-only. It is not
+# a lost entry, and re-adding such a file would silently downgrade the database.
+
+source "$(dirname "$(readlink -f "$0")")/_common.sh"
+
+ALLOWLIST=${KEDRA_REPO_ALLOWLIST:-$(dirname "$(readlink -f "$0")")/../config/kedra-repo-packages.txt}
+
+(( $# )) || kedra_die "usage: ${0##*/} PKGFILE..."
+
+kedra_require_signing_key
+[[ -r ${ALLOWLIST} ]] || kedra_die "package allowlist not readable: ${ALLOWLIST}"
+
+allowed() {
+	grep -qxF "$1" <(grep -vE '^\s*(#|$)' "${ALLOWLIST}")
+}
+
+sha256_of() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# The pacman identity of a package file: pkgname, full pkgver and arch, printed
+# tab-separated. .PKGINFO is a plain `key = value` file at the root of every
+# pacman package, and its pkgver is the FULL version -- epoch:pkgver-pkgrel.
+#
+# Read in one pass so a package is decompressed once rather than three times.
+pkg_identity() { # pkg_identity FILE -> "name<TAB>ver<TAB>arch"
+	local info
+	info=$(bsdtar -xOqf "$1" .PKGINFO 2>/dev/null) || return 1
+	awk -F' = ' '
+		$1 == "pkgname" { n = $2 }
+		$1 == "pkgver"  { v = $2 }
+		$1 == "arch"    { a = $2 }
+		END {
+			if (n == "" || v == "" || a == "") exit 1
+			printf "%s\t%s\t%s", n, v, a
+		}' <<<"${info}"
+}
+
+id_name() { printf '%s' "${1%%$'\t'*}"; }
+id_ver()  { local r=${1#*$'\t'}; printf '%s' "${r%%$'\t'*}"; }
+id_arch() { printf '%s' "${1##*$'\t'}"; }
+id_human() { printf '%s %s (%s)' "$(id_name "$1")" "$(id_ver "$1")" "$(id_arch "$1")"; }
+
+# The container format, from the file's magic bytes rather than from its name.
+#
+# Taking it from the extension would let a renamed input decide part of the
+# canonical destination, which is the whole thing this function exists to stop.
+container_suffix() { # container_suffix FILE -> ".pkg.tar.zst" | ...
+	local magic
+	magic=$(od -An -tx1 -N6 -- "$1" | tr -d ' \n')
+	case ${magic} in
+		28b52ffd*)    printf '.pkg.tar.zst' ;;
+		fd377a585a00) printf '.pkg.tar.xz' ;;
+		1f8b*)        printf '.pkg.tar.gz' ;;
+		425a68*)      printf '.pkg.tar.bz2' ;;
+		*)
+			# An uncompressed pacman package: POSIX tar, "ustar" at offset 257.
+			[[ $(dd if="$1" bs=1 skip=257 count=5 status=none) == ustar ]] ||
+				return 1
+			printf '.pkg.tar' ;;
+	esac
+}
+
+# The name this artifact must have in the docroot: exactly what makepkg would
+# have called it. Never the input's own basename.
+canonical_basename() { # canonical_basename IDENTITY SUFFIX
+	printf '%s-%s-%s%s' "$(id_name "$1")" "$(id_ver "$1")" "$(id_arch "$1")" "$2"
+}
+
+mkdir -p "${KEDRA_REPO_DIR}"
+
+# ---------------------------------------------------------------------------
+# The docroot, indexed by pacman identity.
+#
+# Every artifact is asked what it is. Nothing here trusts a filename, so an
+# artifact someone renamed is still found by the identity checks below.
+# ---------------------------------------------------------------------------
+declare -A published_paths=()   # identity -> newline-separated paths
+
+shopt -s nullglob
+for artifact in "${KEDRA_REPO_DIR}"/*.pkg.tar.*; do
+	[[ ${artifact} == *.sig ]] && continue
+	[[ -f ${artifact} ]] || continue
+	if ! artifact_id=$(pkg_identity "${artifact}"); then
+		kedra_die "$(printf '%s\n' \
+			"${artifact##*/} is in the served tree but its .PKGINFO cannot be read." \
+			"The repository is inconsistent and publishing will not paper over it;" \
+			"resolve it by hand before publishing again.")"
+	fi
+	published_paths["${artifact_id}"]+="${artifact}"$'\n'
+done
+shopt -u nullglob
+
+# ---------------------------------------------------------------------------
+# Phase 1 -- decide everything, change nothing.
+#
+# Every input is fully checked, against the rest of the batch and then against
+# the served tree, before the first byte of that tree is touched. A batch
+# containing one immutability violation must not leave the repository
+# half-updated, so every failure has to happen here rather than partway through
+# the loop at the end.
+# ---------------------------------------------------------------------------
+
+declare -A batch_path=()   # identity -> the input file that carries it
+declare -A batch_sha=()    # identity -> its sha256
+declare -A batch_dest=()   # identity -> canonical docroot basename
+declare -a batch_order=()  # identities, in the order given on the command line
+
+# --- 1a: the batch against itself ------------------------------------------
+for pkg in "$@"; do
+	[[ -f ${pkg} ]] || kedra_die "no such package file: ${pkg}"
+	[[ ${pkg} == *.pkg.tar.* ]] || kedra_die "not a pacman package: ${pkg}"
+
+	identity=$(pkg_identity "${pkg}") ||
+		kedra_die "could not read pkgname/pkgver/arch from ${pkg}"
+
+	name=$(id_name "${identity}")
+	allowed "${name}" ||
+		kedra_die "'${name}' is not in ${ALLOWLIST##*/}; add it deliberately before publishing"
+
+	suffix=$(container_suffix "${pkg}") ||
+		kedra_die "${pkg} is not a package container this repository knows how to name (expected zstd, xz, gzip, bzip2 or plain tar)"
+
+	sha=$(sha256_of "${pkg}")
+	dest=$(canonical_basename "${identity}" "${suffix}")
+
+	if [[ -n ${batch_path["${identity}"]:-} ]]; then
+		# Same identity twice in one invocation.
+		if [[ ${batch_sha["${identity}"]} == "${sha}" ]]; then
+			# Byte-identical: one logical input, named twice. Publishing it
+			# twice would sign, copy and index the same bytes twice, so it is
+			# collapsed here instead.
+			kedra_msg "same artifact offered twice, publishing it once: $(id_human "${identity}")"
+			continue
+		fi
+		kedra_die "$(printf '%s\n' \
+			"TWO DIFFERENT ARTIFACTS FOR ONE PACKAGE IDENTITY IN ONE BATCH" \
+			"" \
+			"  package:   ${name}" \
+			"  version:   $(id_ver "${identity}")" \
+			"  arch:      $(id_arch "${identity}")" \
+			"  first:     ${batch_path["${identity}"]}" \
+			"             sha256 ${batch_sha["${identity}"]}" \
+			"  second:    ${pkg}" \
+			"             sha256 ${sha}" \
+			"" \
+			"These two files disagree about what this version contains, so publishing" \
+			"the batch would publish one of them and silently discard the other. A" \
+			"package identity has exactly one artifact: pkgver or pkgrel must change" \
+			"before the second one can be published." \
+			"" \
+			"Nothing has been written -- not for these two, and not for any other" \
+			"package named on this command line.")"
+	fi
+
+	if [[ ${pkg##*/} != "${dest}" ]]; then
+		# The destination comes from the package's own metadata, so a renamed
+		# input cannot become a second permanent filename for one identity.
+		kedra_warn "${pkg##*/} is not named as its metadata says; publishing it as ${dest}"
+	fi
+
+	batch_path["${identity}"]=${pkg}
+	batch_sha["${identity}"]=${sha}
+	batch_dest["${identity}"]=${dest}
+	batch_order+=("${identity}")
+done
+
+# --- 1b: the batch against what is already published ------------------------
+declare -a to_publish=()   # identities to sign, copy and index
+declare -a skipped=()      # identities already present and identical
+
+for identity in "${batch_order[@]}"; do
+	pkg=${batch_path["${identity}"]}
+	dest=${batch_dest["${identity}"]}
+
+	mapfile -t present < <(printf '%s' "${published_paths["${identity}"]:-}")
+	[[ ${#present[@]} -eq 1 && -z ${present[0]} ]] && present=()
+
+	if (( ${#present[@]} == 0 )); then
+		# A canonical destination that exists without carrying this identity is
+		# a repository that disagrees with itself, and publishing over it would
+		# destroy whatever is really there.
+		if [[ -e ${KEDRA_REPO_DIR}/${dest} ]]; then
+			kedra_die "$(printf '%s\n' \
+				"${dest} already exists in the docroot but is not $(id_human "${identity}")." \
+				"The repository is inconsistent; resolve it by hand before publishing.")"
+		fi
+		to_publish+=("${identity}")
+		continue
+	fi
+
+	if (( ${#present[@]} > 1 )); then
+		kedra_die "$(printf '%s\n' \
+			"$(id_human "${identity}") already exists in the docroot more than once:" \
+			"${present[@]/#/  }" \
+			"the repository is inconsistent; resolve it by hand before publishing")"
+	fi
+
+	if [[ $(sha256_of "${present[0]}") != ${batch_sha["${identity}"]} ]]; then
+		kedra_die "$(printf '%s\n' \
+			"IMMUTABLE PACKAGE IDENTITY ALREADY PUBLISHED" \
+			"" \
+			"  package:   $(id_name "${identity}")" \
+			"  version:   $(id_ver "${identity}")" \
+			"  arch:      $(id_arch "${identity}")" \
+			"  published: ${present[0]##*/}" \
+			"             sha256 $(sha256_of "${present[0]}")" \
+			"  offered:   ${pkg}" \
+			"             sha256 ${batch_sha["${identity}"]}" \
+			"" \
+			"A published artifact never changes. Bump pkgrel (or pkgver) and build" \
+			"again -- systems that already synced kedra.db have cached the published" \
+			"checksum, so replacing the bytes under this version does not produce an" \
+			"upgrade, it produces a repository that disagrees with itself." \
+			"" \
+			"If nothing in this package actually changed, the answer is NOT to bump:" \
+			"it is to leave it alone. makepkg is not byte-reproducible -- .BUILDINFO" \
+			"and .MTREE record build times and paths -- so simply rebuilding unchanged" \
+			"sources produces a different artifact for the same identity. Publish only" \
+			"what genuinely changed." \
+			"" \
+			"Nothing has been written. There is no --force; see the header of this" \
+			"script for the manual repair path.")"
+	fi
+
+	# Identical bytes: this identity is already published. Nothing is copied,
+	# nothing is re-signed, and the artifact keeps the signature it went out
+	# with -- so re-running a publish is always safe and always a no-op.
+	#
+	# The existing signature is still checked, because discovering here that a
+	# served artifact cannot be verified is much better than discovering it on a
+	# user's machine. It is reported, not repaired: re-signing published bytes is
+	# repository repair, and repair does not belong in the publish path.
+	if [[ ! -f ${present[0]}.sig ]] ||
+		! kedra_gpg --verify "${present[0]}.sig" "${present[0]}" 2>/dev/null; then
+		kedra_die "$(printf '%s\n' \
+			"${present[0]##*/} is already published, but its signature is missing or does not verify." \
+			"The served repository is broken and this is not something publishing should paper over." \
+			"Repair it deliberately: re-sign the artifact by hand, or remove it and republish.")"
+	fi
+
+	skipped+=("${present[0]##*/}")
+done
+
+# --- 1c: index the newest release of a name LAST ----------------------------
+#
+# repo-add takes the last entry it is handed for a package name as the one the
+# database ends up naming; it does not compare versions. A batch that offered
+# 1.0-2 before 1.0-1 would therefore leave kedra.db naming the OLDER release -- a
+# downgrade produced purely by argument order, and exactly the outcome the
+# superseded-release rule exists to prevent. Same-name identities are ordered by
+# vercmp here, so whatever else a batch contains, the database ends up naming the
+# newest release in it.
+order_publications() {
+	local -i i j count=${#to_publish[@]}
+	local a b
+	for (( i = 1; i < count; i++ )); do
+		for (( j = 0; j + 1 < count; j++ )); do
+			a=${to_publish[j]}; b=${to_publish[j + 1]}
+			[[ $(id_name "${a}") == "$(id_name "${b}")" ]] || continue
+			if (( $(vercmp "$(id_ver "${a}")" "$(id_ver "${b}")") > 0 )); then
+				to_publish[j]=${b}; to_publish[j + 1]=${a}
+			fi
+		done
+	done
+}
+if (( ${#to_publish[@]} > 1 )); then
+	order_publications
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 2 -- everything above passed, so now the served tree may change.
+# ---------------------------------------------------------------------------
+for base in "${skipped[@]}"; do
+	kedra_msg "already published identically, nothing to do: ${base}"
+done
+
+published=()
+for identity in "${to_publish[@]}"; do
+	pkg=${batch_path["${identity}"]}
+	base=${batch_dest["${identity}"]}
+	kedra_msg "signing ${base}"
+	kedra_gpg --pinentry-mode loopback --passphrase '' --yes \
+		--detach-sign --no-armor --local-user "${KEDRA_SIGNING_KEY}" \
+		--output "${KEDRA_REPO_DIR}/${base}.sig" "${pkg}"
+
+	install -m644 "${pkg}" "${KEDRA_REPO_DIR}/${base}"
+
+	# Verify what was actually written, not what we think we wrote.
+	kedra_gpg --verify "${KEDRA_REPO_DIR}/${base}.sig" "${KEDRA_REPO_DIR}/${base}" 2>/dev/null ||
+		kedra_die "signature verification failed for ${base}"
+
+	published+=("${base}")
+done
+
+# Nothing new to index means the database must not be rewritten -- and therefore
+# must not be re-signed either. An idempotent publish leaves the repository
+# byte-for-byte as it was.
+if (( ${#published[@]} == 0 )); then
+	kedra_msg "nothing to publish; ${KEDRA_REPO_NAME}.db unchanged"
+	exit 0
+fi
+
+kedra_msg "updating ${KEDRA_REPO_NAME}.db"
+# repo-add signs the database with the same key. GNUPGHOME is exported because
+# repo-add shells out to plain gpg.
+GNUPGHOME="${KEDRA_SIGNING_GNUPGHOME}" GPGKEY="${KEDRA_SIGNING_KEY}" \
+	repo-add --quiet --sign --verify --key "${KEDRA_SIGNING_KEY}" \
+	"${KEDRA_REPO_DIR}/${KEDRA_REPO_NAME}.db.tar.zst" \
+	"${published[@]/#/${KEDRA_REPO_DIR}/}"
+
+kedra_msg "published ${#published[@]} package(s) to ${KEDRA_REPO_DIR}"

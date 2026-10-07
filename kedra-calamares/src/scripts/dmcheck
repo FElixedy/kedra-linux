@@ -1,0 +1,58 @@
+#!/bin/bash
+#set -e
+###############################################################################
+# Author    :   Erik Dubois
+# Website   :   https://www.erikdubois.be
+# Website   :   https://www.arcolinux.info
+# Website   :   https://www.arcolinux.com
+# Website   :   https://www.arcolinuxd.com
+# Website   :   https://www.arcolinuxb.com
+# Website   :   https://www.arcolinuxiso.com
+# Website   :   https://www.arcolinuxforum.com
+###############################################################################
+#
+# Links /etc/systemd/system/display-manager.service at whichever display manager
+# was actually installed. Later matches win, so the order below is the priority.
+#
+# KEDRA: `pacman -Qs` replaced with an exact-name query.
+#
+# `pacman -Qs <pkg>` is a SUBSTRING search over package names *and descriptions*.
+# For most of the names below that is merely sloppy, but for `ly` it is actively
+# wrong: on a normal desktop install `pacman -Qs ly` matches dozens of packages
+# (automake, baobab, ...), so upstream's version of this script always took the
+# `ly` branch. Every installed system therefore had getty@tty2 removed and a
+# DANGLING symlink to a non-existent ly@.service left in
+# multi-user.target.wants -- which systemd reports as a failed/not-found unit on
+# every boot, on a system that never had ly installed.
+#
+# `pacman -Qq -- <pkg>` matches the package name exactly while still resolving
+# `provides`, which is the actual intent.
+
+installed() { pacman -Qq -- "$1" >/dev/null 2>&1; }
+
+if installed ly; then
+  rm -f /etc/systemd/system/getty.target.wants/getty@tty2.service
+  ln -sf /usr/lib/systemd/system/ly@.service /etc/systemd/system/multi-user.target.wants/ly@tty2.service
+fi
+if installed plasma-login-manager; then
+  ln -sf /usr/lib/systemd/system/plasmalogin.service /etc/systemd/system/display-manager.service
+fi
+if installed sddm; then
+  ln -sf /usr/lib/systemd/system/sddm.service /etc/systemd/system/display-manager.service
+fi
+if installed gdm; then
+  ln -sf /usr/lib/systemd/system/gdm.service /etc/systemd/system/display-manager.service
+fi
+if installed cosmic-greeter; then
+  ln -sf /usr/lib/systemd/system/cosmic-greeter.service /etc/systemd/system/display-manager.service
+fi
+if installed lxdm; then
+  ln -sf /usr/lib/systemd/system/lxdm.service /etc/systemd/system/display-manager.service
+fi
+if installed lightdm; then
+  ln -sf /usr/lib/systemd/system/lightdm.service /etc/systemd/system/display-manager.service
+fi
+# FIXME: should also support greetd, but not break cosmic-greeter...
+if installed noctalia-greeter; then
+  ln -sf /usr/lib/systemd/system/greetd.service /etc/systemd/system/display-manager.service
+fi

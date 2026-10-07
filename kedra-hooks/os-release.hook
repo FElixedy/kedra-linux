@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = filesystem
+
+[Action]
+Description = Add Kedra specific config.
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/kedra-branding os-release

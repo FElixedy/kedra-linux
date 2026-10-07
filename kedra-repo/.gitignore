@@ -1,0 +1,12 @@
+# Published repository docroots and staged packages live outside the tree
+# ($KEDRA_REPO_ROOT / $KEDRA_STAGING_DIR); these are a backstop.
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.db.tar.zst*
+*.files.tar.zst*
+
+# Never commit signing material.
+*.key
+*.asc
+gnupg/
+private-keys-v1.d/

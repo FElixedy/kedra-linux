@@ -1,0 +1,19 @@
+##
+## Kedra Linux repository mirrorlist
+##
+## Installed as /etc/pacman.d/kedra-mirrorlist and included from the [kedra]
+## section of /etc/pacman.conf, mirroring how CachyOS ships its own mirrorlists.
+##
+## Server lines use pacman's `$repo` and `$arch` variables, so the same line
+## works unchanged when publishing moves from a local directory to HTTPS:
+##
+##     Server = <base>/$repo/os/$arch
+##
+## No production Kedra mirror exists yet -- no domain has been chosen, and this
+## file must not pretend otherwise. The only entry below is the local
+## development docroot written by kedra-repo-publish. Replace it (or prepend
+## real mirrors above it) once hosting is decided.
+##
+
+## Local development repository
+Server = file://@KEDRA_REPO_ROOT@/$repo/os/$arch

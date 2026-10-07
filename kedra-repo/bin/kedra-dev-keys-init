@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# kedra-dev-keys-init -- create the DEVELOPMENT ONLY Kedra signing keys.
+#
+# ############################################################################
+# #  THESE KEYS ARE NOT A KEDRA PRODUCTION IDENTITY.                         #
+# #  They exist only so the repository/signing pipeline can be validated on  #
+# #  a developer machine before production signing infrastructure exists.    #
+# #  They are unprotected (no passphrase), use the reserved .invalid TLD and  #
+# #  are stored outside every git working tree.                              #
+# #  See docs/signing.md for how to replace them.                            #
+# ############################################################################
+#
+# Topology created here is the same topology production must use:
+#
+#   Kedra Master Key   (certify + sign, trust anchor, kept offline)
+#        │ certifies
+#        ▼
+#   Kedra Packager Key (signs packages and the repository database)
+#
+# Only the master fingerprint goes into kedra-trusted. Packager keys become
+# valid through the master's certification, so a packager key can be rotated by
+# shipping a new kedra.gpg without changing the trust anchor.
+
+source "$(dirname "$(readlink -f "$0")")/_common.sh"
+
+KEYRING_SRC=${KEDRA_KEYRING_SRC:-$(readlink -f "$(dirname "$(readlink -f "$0")")/../../kedra-keyring")}
+
+MASTER_UID='Kedra Linux DEVELOPMENT Master Key (DEVELOPMENT ONLY - NOT A PRODUCTION KEDRA IDENTITY) <dev-master@kedra.invalid>'
+PACKAGER_UID='Kedra Linux DEVELOPMENT Packager (DEVELOPMENT ONLY - NOT A PRODUCTION KEDRA IDENTITY) <dev-packager@kedra.invalid>'
+
+state_dir=$(dirname "${KEDRA_SIGNING_GNUPGHOME}")
+mkdir -p "${KEDRA_SIGNING_GNUPGHOME}"
+chmod 700 "${state_dir}" "${KEDRA_SIGNING_GNUPGHOME}"
+
+cat >"${state_dir}/README" <<'EOF'
+Kedra Linux DEVELOPMENT signing material.
+
+DEVELOPMENT ONLY. Not a production Kedra signing identity.
+The secret keys here have no passphrase and must never be published,
+committed, or used to sign anything users will install.
+
+Delete this directory to revoke all local development trust.
+EOF
+
+fpr_of() {
+	kedra_gpg --with-colons --list-keys "$1" 2>/dev/null |
+		awk -F: '/^fpr:/ {print $10; exit}'
+}
+
+gen_key() {
+	local uid=$1 usage=$2
+	# No passphrase: these are development keys, and an unattended local test
+	# pipeline must not prompt. Production keys are passphrase/token protected.
+	kedra_gpg --pinentry-mode loopback --passphrase '' \
+		--quick-generate-key "${uid}" rsa4096 "${usage}" 2y
+}
+
+master_fpr=$(fpr_of "${MASTER_UID}" || true)
+if [[ -z ${master_fpr} ]]; then
+	kedra_msg "generating DEVELOPMENT master key"
+	gen_key "${MASTER_UID}" cert,sign
+	master_fpr=$(fpr_of "${MASTER_UID}")
+fi
+kedra_msg "master:   ${master_fpr}"
+
+packager_fpr=$(fpr_of "${PACKAGER_UID}" || true)
+if [[ -z ${packager_fpr} ]]; then
+	kedra_msg "generating DEVELOPMENT packager key"
+	gen_key "${PACKAGER_UID}" sign
+	packager_fpr=$(fpr_of "${PACKAGER_UID}")
+fi
+kedra_msg "packager: ${packager_fpr}"
+
+# Master certifies the packager. This must be an exportable signature: it is
+# the only thing that makes the packager key valid on client systems.
+kedra_msg "certifying packager key with the master key"
+kedra_gpg --yes --default-key "${master_fpr}" --quick-sign-key "${packager_fpr}" >/dev/null
+
+# Locally, trust the master ultimately so signature checks in this GNUPGHOME
+# behave the same way a populated client keyring will.
+printf '%s:6:\n' "${master_fpr}" | kedra_gpg --import-ownertrust
+
+printf '%s\n' "${packager_fpr}" >"${state_dir}/packager-fingerprint"
+printf '%s\n' "${master_fpr}" >"${state_dir}/master-fingerprint"
+
+# Export public material into the kedra-keyring package sources.
+#
+# NOTE: a plain --export is required. --export-options export-minimal would
+# strip the master's certification of the packager key and break trust.
+kedra_msg "exporting public keyring material into ${KEYRING_SRC}"
+[[ -d ${KEYRING_SRC} ]] || kedra_die "kedra-keyring source tree not found at ${KEYRING_SRC}"
+kedra_gpg --yes --output "${KEYRING_SRC}/kedra.gpg" \
+	--export "${master_fpr}" "${packager_fpr}"
+# Ownertrust `5` = full. GnuPG's ownertrust scale is 2=unknown, 3=never,
+# 4=marginal, 5=full, 6=ultimate.
+#
+# Arch uses 4 (marginal) because its model requires three master-key signatures
+# before a packager key becomes valid; with a single master that would leave
+# every packager key merely marginal and pacman would reject its signatures.
+# Kedra has one master key, so it must be fully trusted for its certification
+# of the packager key to count. Switching to Arch's 3-of-N marginal scheme
+# later is purely a change to this file plus additional master keys.
+printf '%s:5:\n' "${master_fpr}" >"${KEYRING_SRC}/kedra-trusted"
+[[ -e ${KEYRING_SRC}/kedra-revoked ]] || : >"${KEYRING_SRC}/kedra-revoked"
+
+kedra_msg "done -- public material is in ${KEYRING_SRC}, secrets stay in ${KEDRA_SIGNING_GNUPGHOME}"

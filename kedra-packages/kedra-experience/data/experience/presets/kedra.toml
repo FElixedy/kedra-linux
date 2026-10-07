@@ -1,0 +1,52 @@
+# Kedra Experience preset: kedra
+#
+# Declares WHICH modules make up the Kedra experience and WHETHER each is
+# active. It declares no GNOME values — those live in the modules, and are not
+# implemented yet.
+#
+# `enabled` here is activation state. It is unrelated to a module's `tier` and
+# unrelated to the `relation` strength of that module's packages. A `core`
+# module is not automatically enabled, and an enabled module does not upgrade
+# its optional packages to required ones.
+
+schema_version = 6
+
+[preset]
+id = "kedra"
+name = "Kedra Experience"
+description = "Kedra's curated GNOME desktop experience. Opinionated defaults, every module user-overridable."
+version = "0.1.0"
+kind = "base"
+user_selectable = true
+applies_experience_layer = true
+
+[[preset.modules]]
+id = "desktop"
+enabled = true
+
+[[preset.modules]]
+id = "workflow"
+enabled = true
+
+[[preset.modules]]
+id = "appearance"
+enabled = true
+
+[[preset.modules]]
+id = "terminal"
+enabled = true
+
+[[preset.modules]]
+id = "extensions"
+enabled = true
+
+[[preset.modules]]
+id = "integration"
+enabled = true
+
+# Declared by this preset, deliberately not activated. Listing it here is what
+# makes it visible to a future selection UI as "available, off by default"
+# rather than invisible.
+[[preset.modules]]
+id = "extras"
+enabled = false

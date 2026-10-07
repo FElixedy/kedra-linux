@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+#
+# kedra-target-repository -- make [kedra] resolvable in the INSTALLED system.
+#
+#   kedra-target-repository <target-root>
+#
+# Runs in the live environment, after the target's /etc/pacman.conf is in place
+# and before pacstrap, because pacstrap is the first thing that needs to resolve
+# kedra-hooks out of [kedra].
+#
+# WHY THIS EXISTS
+# ---------------
+# Kedra has no package hosting yet, and no Kedra domain has been chosen, so there
+# is no HTTPS URL for [kedra] and inventing one is not an option. The accepted
+# live medium solves its own half of the problem by carrying the signed [kedra]
+# docroot inside the ISO and pointing at it with `file://`.
+#
+# That is enough to install FROM, but not enough to leave BEHIND: a file:// path
+# that only exists on the live medium becomes a dead repository the moment the
+# machine reboots, and `pacman -Syu` on the installed system would fail on it.
+#
+# So the snapshot is copied onto the installed disk. Pacman then verifies its
+# signatures on the target exactly as it would a remote repository's -- nothing
+# here relaxes SigLevel, and no key material is copied (see the allowlist below;
+# trust arrives separately, via kedra-keyring and the keyring copied by
+# shellprocess_initialize_pacman).
+#
+# This is deliberately labelled development infrastructure: the path contains
+# "dev-repo" and lives under /var/lib, not /usr, so it is not pretending to be
+# something pacman manages.
+#
+# WHEN KEDRA HAS HOSTING
+# ----------------------
+# Nothing here needs deleting first. If the live medium's [kedra] Server is an
+# HTTPS URL rather than a file:// one -- which is exactly what happens on the day
+# hosting exists -- this script copies nothing, writes that URL into the target,
+# and says so. The whole file can then be dropped at leisure.
+
+set -uo pipefail
+
+readonly TARGET=${1:?usage: kedra-target-repository <target-root>}
+readonly REPO=kedra
+readonly TARGET_REPO_DIR=/var/lib/kedra/dev-repo
+
+# Calamares does not capture stderr from shellprocess jobs, and it does not
+# reliably surface their stdout either -- a failure here was once reported as
+# "There was no output from the command", with the actual reason lost. So
+# everything this script says also goes to a log file that survives the failure
+# and can be read out of the live system afterwards.
+readonly LOGFILE=/tmp/kedra-target-repository.log
+exec 2>&1
+
+msg()  { printf '==> %s\n' "$*" | tee -a "${LOGFILE}"; }
+die()  { printf '==> ERROR: %s\n' "$*" | tee -a "${LOGFILE}"; exit 1; }
+
+[[ -d ${TARGET} ]] || die "target root ${TARGET} does not exist"
+[[ -f ${TARGET}/etc/pacman.conf ]] ||
+	die "${TARGET}/etc/pacman.conf is missing -- this must run after the target pacman.conf is installed"
+
+# The live configuration is the single source of truth for where [kedra] is.
+# pacman-conf expands $repo and $arch, so this is the concrete directory.
+live_server=$(pacman-conf --repo "${REPO}" Server 2>/dev/null | head -n1) ||
+	die "the live system has no [${REPO}] repository configured"
+[[ -n ${live_server} ]] || die "the live [${REPO}] repository has no Server"
+
+# ---------------------------------------------------------------------------
+# Production hosting: nothing to copy, just carry the URL into the target.
+# ---------------------------------------------------------------------------
+if [[ ${live_server} != file://* ]]; then
+	msg "live [${REPO}] is remote (${live_server}) -- no snapshot needed"
+	# Rewrite only the Server line inside the [kedra] section.
+	awk -v url="${live_server}" '
+		/^\[/          { in_kedra = ($0 == "[kedra]") }
+		in_kedra && /^Server[[:space:]]*=/ { print "Server = " url; next }
+		                 { print }
+	' "${TARGET}/etc/pacman.conf" >"${TARGET}/etc/pacman.conf.new" &&
+		mv "${TARGET}/etc/pacman.conf.new" "${TARGET}/etc/pacman.conf" ||
+		die "failed to rewrite the [${REPO}] Server in the target pacman.conf"
+	msg "target [${REPO}] Server set to ${live_server}"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Development: copy the signed snapshot onto the installed disk.
+# ---------------------------------------------------------------------------
+live_path=${live_server#file://}
+# Layout is <docroot>/$repo/os/$arch, both on the live medium and in the target,
+# and it is already the layout a future HTTPS server will publish.
+live_docroot=${live_path%"/${REPO}/os/"*}
+[[ ${live_docroot} != "${live_path}" ]] ||
+	die "live [${REPO}] Server ${live_path} is not in <docroot>/${REPO}/os/<arch> layout"
+[[ -d ${live_path} ]] || die "live [${REPO}] docroot ${live_path} does not exist"
+[[ -f ${live_path}/${REPO}.db ]] ||
+	die "live [${REPO}] docroot ${live_path} has no ${REPO}.db"
+
+msg "copying the signed [${REPO}] snapshot ${live_docroot} -> ${TARGET}${TARGET_REPO_DIR}"
+
+# Refuse to copy anything that is not repository content. This is the guard that
+# keeps signing material out of the installed system: the development secret keys
+# live outside every git tree and outside the ISO, but a positive allowlist is
+# what makes that a property rather than a hope.
+while IFS= read -r rel; do
+	case ${rel} in
+		*.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.zst.sig|*.pkg.tar.xz.sig) ;;
+		*.db|*.db.sig|*.db.tar.zst|*.db.tar.zst.sig) ;;
+		*.files|*.files.sig|*.files.tar.zst|*.files.tar.zst.sig) ;;
+		# repo-add renames the previous database to *.old every time a package is
+		# published, so a docroot that has been published to more than once always
+		# contains these. They are stale backups of a database the target is about
+		# to receive a current copy of: known, harmless, and of no use to the
+		# installed system, so they are recognised and then deleted after the copy
+		# rather than either dying on them or silently shipping them.
+		*.old|*.old.sig) ;;
+		*)
+			die "refusing to copy unexpected file from the [${REPO}] docroot: ${rel}" ;;
+	esac
+done < <(find "${live_docroot}" -mindepth 1 \( -type f -o -type l \) -printf '%P\n')
+
+install -d -m 0755 "${TARGET}${TARGET_REPO_DIR}"
+# -a preserves the kedra.db -> kedra.db.tar.zst symlinks that repo-add creates.
+cp -a "${live_docroot}/." "${TARGET}${TARGET_REPO_DIR}/" ||
+	die "failed to copy the [${REPO}] snapshot into the target"
+
+# Drop repo-add's stale database backups: the installed system has no use for the
+# previous revision of a database it just received.
+find "${TARGET}${TARGET_REPO_DIR}" \( -name '*.old' -o -name '*.old.sig' \) -delete
+
+# 0755/0644 throughout: pacman downloads as the unprivileged DownloadUser (alpm),
+# which has to be able to read this tree.
+find "${TARGET}${TARGET_REPO_DIR}" -type d -exec chmod 0755 {} +
+find "${TARGET}${TARGET_REPO_DIR}" -type f -exec chmod 0644 {} +
+
+target_db=${TARGET}${TARGET_REPO_DIR}/${REPO}/os/$(uname -m)/${REPO}.db
+[[ -f ${target_db} ]] || die "snapshot copied but ${target_db#"${TARGET}"} is missing in the target"
+[[ -f ${target_db}.sig || -f ${target_db%.db}.db.tar.zst.sig ]] ||
+	die "snapshot copied but the ${REPO} database signature is missing in the target"
+
+# The shipped target pacman.conf must already point here; say so loudly if the
+# two ever drift apart, rather than producing a target with a dead repository.
+grep -q "^Server = file://${TARGET_REPO_DIR}/\$repo/os/\$arch$" "${TARGET}/etc/pacman.conf" ||
+	die "target pacman.conf does not point [${REPO}] at ${TARGET_REPO_DIR} -- src/kedra/pacman.conf and this script have drifted"
+
+msg "[${REPO}] snapshot in place; the installed system keeps a working, signed [${REPO}]"

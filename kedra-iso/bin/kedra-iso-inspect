@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+#
+# kedra-iso-inspect -- verify a BUILT ISO, before anyone boots it.
+#
+#   kedra-iso-inspect ISO
+#
+# kedra-iso-validate checks the profile: the inputs a build will be made from.
+# This checks the output. The two are not the same claim, and M0 is the proof:
+# the profile named kedra-calamares and the package list resolved, while the
+# artifact that actually got installed carried branding from an older commit.
+#
+# Nothing is mounted and no root is required. The ISO is an ISO9660 image read
+# with osirrox, and the root filesystem inside it is a squashfs read with
+# unsquashfs -- both of which extract single paths without privilege.
+
+set -euo pipefail
+
+iso=${1:-}
+[[ -n ${iso} && -f ${iso} ]] || { printf 'usage: %s ISO\n' "${0##*/}" >&2; exit 2; }
+
+work=$(mktemp -d -t kedra-iso-inspect-XXXXXX)
+trap 'chmod -R u+rwX -- "${work}" 2>/dev/null; rm -rf -- "${work}"' EXIT
+
+fail=0
+ok()   { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; fail=1; }
+info() { printf '       %s\n' "$*"; }
+head() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+
+# PIPELINES AND set -o pipefail
+# -----------------------------
+# `producer | grep -q` is a trap here: grep -q exits on the first match, the
+# producer takes SIGPIPE, and pipefail turns the whole pipeline's status into
+# 141 -- a FAILURE, reported for a package that is present. Whether it happens
+# depends on how far through its output the producer had got, so it shows up as
+# a handful of arbitrary packages being reported missing and changes between
+# runs. The same applies to `... | head -n`.
+#
+# So no question here is answered with an early-exiting consumer. awk reads its
+# whole input and answers with an exit status.
+have_line() { awk -v n="$2" '$1 == n { found = 1 } END { exit !found }' "$1"; }
+first_n()   { awk -v n="$2" 'NR <= n' "$1"; }
+
+for t in osirrox unsquashfs bsdtar pacman-conf; do
+	command -v "$t" >/dev/null || { printf 'missing tool: %s\n' "$t" >&2; exit 2; }
+done
+
+head "ISO image"
+info "file:   $(basename "${iso}")"
+info "size:   $(stat -c%s "${iso}") bytes ($(numfmt --to=iec "$(stat -c%s "${iso}")"))"
+info "sha256: $(sha256sum "${iso}" | cut -d' ' -f1)"
+
+# --- pull the pieces we need out of the ISO --------------------------------
+iso_extract() { # iso_extract <path-in-iso> <dest>
+	osirrox -indev "${iso}" -extract "$1" "$2" >/dev/null 2>&1
+}
+
+head "Root filesystem"
+sfs=""
+for cand in /arch/x86_64/airootfs.sfs /arch/x86_64/airootfs.erofs; do
+	if iso_extract "${cand}" "${work}/airootfs.img"; then sfs=${cand}; break; fi
+done
+[[ -n ${sfs} ]] || { bad "no airootfs image found inside the ISO"; exit 1; }
+ok "found ${sfs} ($(numfmt --to=iec "$(stat -c%s "${work}/airootfs.img")"))"
+
+sq() { # sq <path-in-squashfs...> -- extract into ${work}/root
+	unsquashfs -n -f -d "${work}/root" "${work}/airootfs.img" "$@" >/dev/null 2>&1
+}
+
+sq /etc/pacman.conf /etc/pacman.d /etc/os-release /usr/lib/os-release \
+   /usr/share/calamares/branding /etc/calamares /usr/share/kedra || true
+R=${work}/root
+
+# --- package list ----------------------------------------------------------
+head "Packages actually installed in the image"
+pkglist=""
+for cand in /arch/pkglist.x86_64.txt /pkglist.x86_64.txt; do
+	if iso_extract "${cand}" "${work}/pkglist.txt"; then pkglist=${work}/pkglist.txt; break; fi
+done
+if [[ -z ${pkglist} ]]; then
+	# archiso also leaves it beside the ISO
+	cand="$(dirname "${iso}")/$(basename "${iso}" .iso).pkgs.txt"
+	[[ -f ${cand} ]] && pkglist=${cand}
+fi
+if [[ -z ${pkglist} ]]; then
+	bad "no package list found in or beside the ISO"
+else
+	info "package list: ${pkglist} ($(wc -l <"${pkglist}") packages)"
+	pkgver_of() { awk -v n="$1" '$1 == n {print $2; exit}' "${pkglist}"; }
+
+	for p in kedra-hooks kedra-keyring kedra-calamares; do
+		v=$(pkgver_of "$p")
+		[[ -n ${v} ]] && ok "${p} ${v} present" || bad "${p} is MISSING from the image"
+	done
+
+	# M0's defect was a STALE ARTIFACT: the profile named kedra-calamares and
+	# the package list resolved, while the installer that actually got installed
+	# was built from an older commit. What catches that is AGREEMENT between the
+	# release the live system installs and the release staged in the in-image
+	# [kedra] docroot -- checked below, once the docroot has been read.
+	#
+	# This used to pin the literal 3.4.2-2, the M0.1 release. A literal cannot
+	# survive its own milestone: every later release fails a check that is
+	# asserting nothing about the image in front of it.
+	calver=$(pkgver_of kedra-calamares)
+	info "kedra-calamares release in the image: ${calver:-absent}"
+
+	if have_line "${pkglist}" cachyos-hooks; then
+		bad "a real cachyos-hooks package is installed -- competes with kedra-hooks"
+	else
+		ok "no real cachyos-hooks package in the image"
+	fi
+	if awk '$1 ~ /^cachyos-calamares/ { f = 1 } END { exit !f }' "${pkglist}"; then
+		bad "a cachyos-calamares variant is installed alongside kedra-calamares"
+	else
+		ok "no cachyos-calamares variant in the image"
+	fi
+
+	head "CachyOS technical value retained"
+	for p in linux-cachyos cachyos-settings cachyos-keyring cachyos-mirrorlist \
+	         cachyos-v3-mirrorlist cachyos-v4-mirrorlist cachyos-rate-mirrors chwd; do
+		if have_line "${pkglist}" "$p"; then ok "${p} $(pkgver_of "$p")"
+		else bad "${p} was dropped"; fi
+	done
+fi
+
+# --- the installer's branding, as shipped ----------------------------------
+head "Installer branding inside the image"
+bd=${R}/usr/share/calamares/branding/kedra/branding.desc
+if [[ -f ${bd} ]]; then
+	entry=$(sed -n 's/^[[:space:]]*bootloaderEntryName:[[:space:]]*//p' "${bd}")
+	prod=$(sed -n 's/^[[:space:]]*productName:[[:space:]]*//p' "${bd}")
+	info "productName:         ${prod}"
+	info "bootloaderEntryName: ${entry}"
+	[[ ${entry} == "Kedra" ]] &&
+		ok "bootloaderEntryName is 'Kedra' -- GRUB composes 'Kedra Linux'" ||
+		bad "bootloaderEntryName is '${entry}' -- GRUB would compose '${entry} Linux'"
+	[[ ${prod} == "Kedra Linux" ]] &&
+		ok "productName is 'Kedra Linux' (product identity unchanged)" ||
+		bad "productName is '${prod}', expected 'Kedra Linux'"
+else
+	bad "no Kedra branding.desc in the image at usr/share/calamares/branding/kedra/"
+fi
+if [[ -f ${R}/etc/calamares/modules/bootloader.conf ]]; then
+	efiid=$(sed -n 's/^efiBootloaderId:[[:space:]]*//p' "${R}/etc/calamares/modules/bootloader.conf" | tr -d '"')
+	[[ ${efiid} == kedra ]] &&
+		ok "efiBootloaderId is 'kedra' (EFI entry and ESP directory)" ||
+		bad "efiBootloaderId is '${efiid}', expected 'kedra'"
+fi
+
+# --- signature policy of the shipped configuration -------------------------
+head "Signature policy of the live configuration in the image"
+if [[ -f ${R}/etc/pacman.conf ]]; then
+	grep -nE '^[[:space:]]*SigLevel' "${R}/etc/pacman.conf" | sed 's/^/       /'
+	"$(dirname "$(readlink -f "$0")")/kedra-check-sigpolicy" \
+		--label "image /etc/pacman.conf" "${R}/etc/pacman.conf" || fail=1
+	if grep -qiE '^[[:space:]]*SigLevel[[:space:]]*=.*(TrustAll|Never)' "${R}/etc/pacman.conf"; then
+		bad "an ACTIVE TrustAll/Never SigLevel line survives in the image"
+		grep -niE '^[[:space:]]*SigLevel[[:space:]]*=.*(TrustAll|Never)' "${R}/etc/pacman.conf" | sed 's/^/       /'
+	else
+		ok "no active TrustAll/Never SigLevel line in the image"
+	fi
+else
+	bad "no /etc/pacman.conf in the image"
+fi
+
+# --- identity --------------------------------------------------------------
+head "Identity in the image"
+osr=${R}/etc/os-release; [[ -f ${osr} ]] || osr=${R}/usr/lib/os-release
+if [[ -f ${osr} ]]; then
+	id=$(sed -n 's/^ID=//p' "${osr}" | tr -d '"')
+	[[ ${id} == kedra ]] && ok "ID=kedra" || bad "ID=${id}, expected kedra"
+	sed -n 's/^PRETTY_NAME=//p' "${osr}" | sed 's/^/       PRETTY_NAME=/'
+else
+	info "no os-release captured (kedra-hooks writes it via a pacman hook at install time)"
+fi
+
+# --- the in-image [kedra] docroot ------------------------------------------
+head "In-image [kedra] repository"
+d=${R}/usr/share/kedra/repo/kedra/os/x86_64
+if [[ -d ${d} ]]; then
+	ls -1 "${d}" | sed 's/^/       /'
+	for p in "${d}"/*.pkg.tar.zst; do
+		[[ -e ${p} ]] || continue
+		[[ -f ${p}.sig ]] && ok "$(basename "${p}") has a detached signature" ||
+		                     bad "$(basename "${p}") has NO detached signature"
+	done
+	[[ -f ${d}/kedra.db.sig || -f ${d}/kedra.db.tar.zst.sig ]] &&
+		ok "the repository database is signed" || bad "the repository database is NOT signed"
+	if [[ -z ${calver:-} ]]; then
+		bad "no kedra-calamares in the package list, so the docroot cannot be compared"
+	elif ls "${d}"/kedra-calamares-"${calver}"-*.pkg.tar.zst >/dev/null 2>&1; then
+		ok "the in-image docroot carries the installed release, kedra-calamares ${calver}"
+	else
+		bad "the in-image docroot does not carry kedra-calamares ${calver}, the release the live system installs"
+	fi
+
+	# ONE release per package, and no repo-add .old backups. The docroot on the
+	# workstation is append-only by design; the image must not inherit that.
+	# Shipping a superseded release beside the current one -- the very kind of
+	# staleness M0.1 corrected -- would leave two answers in an image meant to
+	# have one.
+	dupes=$(ls -1 "${d}"/*.pkg.tar.zst 2>/dev/null |
+		sed -E 's|.*/||; s/-[^-]+-[^-]+-(x86_64|any)\.pkg\.tar\.zst$//' |
+		sort | uniq -d || true)
+	if [[ -n ${dupes} ]]; then
+		bad "more than one release of a package in the image docroot: ${dupes//$'\n'/, }"
+	else
+		ok "exactly one release of each package in the image docroot"
+	fi
+	if ls "${d}"/*.old "${d}"/*.old.sig >/dev/null 2>&1; then
+		bad "repo-add .old database backups were copied into the image"
+	else
+		ok "no .old database backups in the image"
+	fi
+else
+	bad "no in-image [kedra] docroot at usr/share/kedra/repo"
+fi
+
+# --- secrets ---------------------------------------------------------------
+head "No private Kedra signing material in the image"
+# The realistic risk is specific: the [kedra] docroot is SIGNED on this
+# workstation and then copied INTO the image, so a mistake in that copy is how
+# secret key material would travel. The signing GNUPGHOME lives outside every
+# git tree precisely so it cannot be swept in by accident -- this verifies it
+# was not.
+#
+# The whole 2.8 GB root filesystem is NOT extracted to answer that. unsquashfs
+# lists every path without unpacking anything, which is both far cheaper and
+# avoids creating a tree whose own permissions make it awkward to delete.
+unsquashfs -ll "${work}/airootfs.img" > "${work}/paths.txt" 2>/dev/null ||
+    { bad "could not list the image contents"; }
+
+if [[ -s ${work}/paths.txt ]]; then
+    info "image contains $(grep -c . "${work}/paths.txt") entries"
+
+    # GnuPG keeps secret keys as private-keys-v1.d/<keygrip>.key, and older
+    # exports as secring.gpg. Neither belongs in a distributed image.
+    secrets=$(grep -oE '(squashfs-root)?/[^ ]*(private-keys-v1\.d/[^ ]*\.key|secring[^ ]*|\.secret\.gpg)$' \
+        "${work}/paths.txt" | sort -u || true)
+    if [[ -n ${secrets} ]]; then
+        bad "secret-key-shaped paths found in the image:"
+        printf '%s\n' "${secrets}" | awk 'NR <= 20 { print "       " $0 }'
+    else
+        ok "no private-keys-v1.d/*.key, secring* or *.secret.gpg anywhere in the image"
+    fi
+
+    # Anything under the Kedra tree that is not one of the two things allowed
+    # to be there.
+    #
+    #   /usr/share/kedra/repo        the signed [kedra] snapshot the build stages
+    #                                into the image: packages, detached
+    #                                signatures and the repository databases.
+    #   /usr/share/kedra/experience  the Experience manifest tree, owned by the
+    #                                kedra-experience PACKAGE. It arrived with
+    #                                M1: the live installer has to be able to
+    #                                run `kedra-experience profiles`, so the
+    #                                manifests are on the image. They are TOML
+    #                                metadata and nothing else.
+    #
+    # The list is deliberately shaped as file kinds rather than a prefix, so a
+    # stray file smuggled into either subtree is still reported.
+    info "Kedra-owned paths in the image:"
+    awk 'match($0, /\/usr\/share\/kedra\/[^ ]*$/) { print substr($0, RSTART, RLENGTH) }' \
+        "${work}/paths.txt" | sort | awk 'NR <= 20 { print "       " $0 }'
+    stray=$(grep -oE '/usr/share/kedra/[^ ]*$' "${work}/paths.txt" |
+        grep -vE '(/$|\.pkg\.tar\.zst$|\.sig$|\.db$|\.files$|\.db\.tar\.zst$|\.files\.tar\.zst$|/repo$|/repo/kedra$|/repo/kedra/os$|/repo/kedra/os/x86_64$|/usr/share/kedra$|/kedra/experience$|/kedra/experience/(modules|presets)$|/kedra/experience/[^ ]*\.toml$)' || true)
+    if [[ -n ${stray} ]]; then
+        bad "unexpected file under /usr/share/kedra (only the signed [kedra] snapshot and the Experience manifest tree belong there):"
+        printf '%s\n' "${stray}" | awk 'NR <= 20 { print "       " $0 }'
+    else
+        ok "/usr/share/kedra holds only repository material and Experience manifests"
+    fi
+
+    # The PUBLIC trust root must be present -- that is what makes [kedra]
+    # verifiable on the live system.
+    if grep -qE '/usr/share/pacman/keyrings/kedra\.gpg$' "${work}/paths.txt"; then
+        ok "public keyring /usr/share/pacman/keyrings/kedra.gpg is shipped (required for trust)"
+    else
+        bad "public keyring /usr/share/pacman/keyrings/kedra.gpg is MISSING"
+    fi
+    grep -oE '/usr/share/pacman/keyrings/[^ ]*$' "${work}/paths.txt" | sort | sed 's/^/       /'
+fi
+
+# Content check, on the small set of files that could plausibly carry an
+# armoured private key rather than on the entire filesystem.
+sq /usr/share/pacman/keyrings /usr/share/kedra >/dev/null 2>&1 || true
+if grep -rl 'PGP PRIVATE KEY BLOCK' "${R}/usr/share/pacman/keyrings" "${R}/usr/share/kedra" 2>/dev/null | grep -q .; then
+    bad "an armoured PGP PRIVATE KEY BLOCK is present in the shipped keyring/repo material:"
+    grep -rl 'PGP PRIVATE KEY BLOCK' "${R}/usr/share/pacman/keyrings" "${R}/usr/share/kedra" 2>/dev/null | sed 's/^/       /'
+else
+    ok "no armoured PGP PRIVATE KEY BLOCK in the shipped keyring or repository material"
+fi
+
+printf '\n'
+if (( fail )); then printf '\033[1;31m==> ISO inspection FAILED\033[0m\n'; exit 1; fi
+printf '\033[1;32m==> ISO inspection passed\033[0m\n'

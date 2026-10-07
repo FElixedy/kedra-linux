@@ -1,0 +1,187 @@
+# Maintainer: Kedra Linux
+#
+# Kedra's installer package. Downstream of CachyOS's cachyos-calamares PKGBUILD
+# (CachyOS-PKGBUILDS @ 8630282, cachyos-calamares-next 3.4.2-13), which is kept
+# as close as possible: the build itself, the cmake options and the SKIP_MODULES
+# list are upstream's, unchanged.
+#
+# WHAT DIFFERS FROM UPSTREAM
+#
+#   pkgname   cachyos-calamares-next -> kedra-calamares
+#   source    upstream's cachyos-dev branch -> this repository's `kedra` branch
+#   package() * installs src/kedra/pacman.conf, the repository configuration the
+#               installed system gets (upstream copies the ISO's pacman-more.conf
+#               instead, which has no [kedra])
+#             * does not install src/images -- those assets were CachyOS-branded
+#               screenshots and are gone from the tree
+#             * makes the Kedra scripts executable explicitly
+#
+# provides/conflicts are upstream's and are load-bearing; see the comment below.
+#
+# BUILD FLAGS: build via packaging/kedra-calamares-buildroot, not bare makepkg. On a
+# CachyOS host, /etc/makepkg.conf sets -march=native, which would produce a binary
+# that SIGILLs on older CPUs. packaging/makepkg.kedra.conf pins the x86-64
+# baseline; the build script applies it and then verifies the artifact.
+
+pkgname=kedra-calamares
+pkgver=3.4.2
+# pkgrel 5: the Experience job now reconciles its package operation on EVERY
+# successful resolve, so revisiting the page and choosing Vanilla removes the
+# Kedra operation the earlier Kedra resolve added -- without it, packages@online
+# installed the Experience into a system whose user had chosen vanilla GNOME.
+# The two Python job modules also require exact JSON types from the resolver
+# instead of coercing them with bool(), so a malformed answer fails closed.
+# Upstream Calamares is still unchanged; 3.4.2-4 stays exactly as it was
+# published.
+pkgrel=5
+pkgdesc='Kedra Linux system installer'
+arch=('x86_64')
+license=(GPL-3.0-or-later)
+# url= is intentionally unset until the Kedra upstream repository location is
+# decided, matching the convention in kedra-hooks and kedra-keyring. A URL that
+# does not resolve is worse than none.
+
+# These two lines are upstream's, and they are what makes the ISO's installer
+# swap safe. Every CachyOS Calamares variant also declares provides=('calamares')
+# / conflicts=('calamares'), so kedra-calamares and cachyos-calamares-next
+# conflict with each other through the virtual `calamares` name -- pacman will
+# refuse to have both installed, which is correct: they own the same
+# /usr/bin/calamares and the same /etc/calamares tree.
+provides=('calamares')
+conflicts=('calamares')
+#
+# NO replaces=('cachyos-calamares-next').
+#
+# It is not needed and it would be wrong. Nothing depends on the CachyOS installer
+# by name -- the ISO package list names it directly, and kedra-iso now names
+# kedra-calamares instead -- so there is no dependency for a `replaces` to satisfy.
+# Declaring one would additionally mean that any CachyOS machine with [kedra]
+# configured would have its installer silently swapped by a routine `pacman -Syu`.
+# Kedra replaces cachyos-hooks that way because Kedra must own the system
+# identity; it has no business doing it to a package nobody asked it to own.
+
+depends=(
+  boost-libs
+  ckbcomp
+  cryptsetup
+  dmidecode
+  gptfdisk
+  hwinfo
+  kconfig
+  kcoreaddons
+  kcrash
+  ki18n
+  kparts
+  kpmcore
+  kservice
+  kwidgetsaddons
+  libpwquality
+  mkinitcpio-openswap
+  networkmanager
+  polkit-qt6
+  python
+  qt6-declarative
+  qt6-svg
+  rsync
+  solid
+  squashfs-tools
+  upower
+  yaml-cpp
+  qt6-imageformats
+  python-toml # for greetd config
+)
+makedepends=(
+  boost
+  cmake
+  doxygen
+  extra-cmake-modules
+  git
+  ninja
+  python-jsonschema
+  python-pyaml
+  python-unidecode
+  qt6-tools
+)
+options=('!emptydirs')
+
+# Built from this working tree's `kedra` branch.
+#
+# Only COMMITTED work is packaged, which is deliberate: it means the package
+# always corresponds to a commit that can be pointed at. $startdir is absolute, so
+# no path is hardcoded here.
+#
+# When Kedra has hosting this becomes the ordinary remote form:
+#   source=("calamares::git+https://<kedra-host>/kedra-calamares.git#branch=kedra")
+source=("calamares::git+file://${startdir}/..#branch=kedra")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "${srcdir}/calamares"
+    # change version
+    _ver="$(grep -m3 -e "  VERSION" CMakeLists.txt | grep -o "[[:digit:]]*" | xargs | sed s'/ /./g')"
+    _ver="$pkgver"
+    printf 'Version: %s-%s\n' "${_ver}" "${pkgrel}"
+    sed -i -e "s|\${CALAMARES_VERSION_MAJOR}.\${CALAMARES_VERSION_MINOR}.\${CALAMARES_VERSION_PATCH}|${_ver}-${pkgrel}|g" CMakeLists.txt
+    sed -i -e "s|CALAMARES_VERSION_RC 1|CALAMARES_VERSION_RC 0|g" CMakeLists.txt
+}
+
+build() {
+    cd "${srcdir}/calamares"
+
+    export CXXFLAGS+=" -fPIC"
+
+    cmake -S . -Bbuild \
+        -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DWITH_APPSTREAM=OFF \
+        -DWITH_PYBIND11=OFF \
+        -DWITH_QT6=ON \
+        -DSKIP_MODULES="dracut dracutlukscfg \
+        dummycpp dummyprocess dummypython dummypythonqt \
+        finishedq keyboardq license localeq notesqml oemid \
+        openrcdmcryptcfg packagechooserq fsresizer \
+        rawfs mkinitfs contextualprocess interactiveterminal \
+        plasmalnf services-openrc \
+        summaryq tracking usersq webview welcomeq"
+
+    cmake --build build
+}
+
+package() {
+    cd "${srcdir}/calamares/build"
+    DESTDIR="${pkgdir}" cmake --build . --target install
+
+    cp "${srcdir}/calamares/settings_offline.conf" "$pkgdir/usr/share/calamares/settings_offline.conf"
+    cp "${srcdir}/calamares/settings_online.conf" "$pkgdir/usr/share/calamares/settings_online.conf"
+    cp "${srcdir}/calamares/settings_online.conf" "$pkgdir/usr/share/calamares/settings.conf"
+
+    local _destdir=etc/calamares
+    install -dm755 "$pkgdir/$_destdir"
+    install -dm755 "$pkgdir/$_destdir/modules"
+    cp -rf "${srcdir}"/calamares/src/modules/*/*.conf "$pkgdir/etc/calamares/modules"
+    cp -rf "${srcdir}/calamares/src/scripts" "$pkgdir/etc/calamares"
+
+    # KEDRA: upstream also does `cp -rf src/images "$pkgdir/etc/calamares"` here.
+    # That directory held the desktop and bootloader screenshots shown by the
+    # package choosers, every one of them a picture of a CachyOS-configured system.
+    # It was removed from the tree along with the `screenshot:` keys that used it.
+
+    # KEDRA: the installed system's pacman configuration. shellprocess-before-online
+    # copies this into the target as /etc/pacman.conf.
+    install -Dm644 "${srcdir}/calamares/src/kedra/pacman.conf" \
+        "$pkgdir/etc/calamares/kedra/pacman.conf"
+
+    # Workaround netinstall.yaml not being installed by cmake
+    cp "${srcdir}/calamares/src/modules/netinstall/netinstall.yaml" "$pkgdir/etc/calamares/modules/netinstall.yaml"
+
+    # KEDRA: belt and braces -- these are invoked as commands by shellprocess jobs,
+    # so a lost executable bit is a failed installation.
+    chmod 755 "$pkgdir/etc/calamares/scripts/kedra-target-repository" \
+              "$pkgdir/etc/calamares/scripts/kedra-verify-target"
+
+    # Delete Desktop Entry to avoid confusion for users
+    # (this package therefore owns no launcher, so there is no launcher to rebrand)
+    rm -rf "$pkgdir/usr/share/applications"
+}

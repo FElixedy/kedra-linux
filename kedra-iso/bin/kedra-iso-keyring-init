@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# Create the BUILD-LOCAL pacman keyring the Kedra ISO build verifies against.
+#
+# This is step 1 of kedra-repo/docs/bootstrap.md ("ISO build host"), implemented
+# so that it does NOT touch the build host's own pacman trust:
+#
+#   * the host's /etc/pacman.d/gnupg is never read, written or reinitialised;
+#   * the host's /etc/pacman.conf is never modified;
+#   * signature verification is never disabled -- SigLevel stays Required, only
+#     the location of the trust store moves.
+#
+# Trust originates from public key material a human reviewed in the kedra-keyring
+# working tree, not from a keyserver. Re-run this whenever kedra-keyring's public
+# material changes; it is cheap and idempotent.
+
+set -euo pipefail
+
+_src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=bin/_kedra.sh
+source "${_src_dir}/_kedra.sh"
+
+msg()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m==> ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+host_keyrings=/usr/share/pacman/keyrings
+[[ -r "${host_keyrings}/archlinux.gpg" ]] ||
+	die "archlinux-keyring is not installed on this build host"
+[[ -r "${host_keyrings}/cachyos.gpg" ]] ||
+	die "cachyos-keyring is not installed on this build host"
+
+keyring_src=$(cd "${KEDRA_KEYRING_SRC}" 2>/dev/null && pwd) ||
+	die "kedra-keyring source tree not found at ${KEDRA_KEYRING_SRC} (override KEDRA_KEYRING_SRC)"
+[[ -r "${keyring_src}/kedra.gpg" ]] ||
+	die "${keyring_src}/kedra.gpg is missing -- is that a kedra-keyring checkout?"
+
+# `pacman-key --populate-from` takes a SINGLE directory, so stage every keyring
+# the build needs into one place: Arch and CachyOS from the host's installed
+# keyring packages, Kedra from the reviewed working tree.
+staging=$(mktemp -d)
+trap 'rm -rf -- "${staging}"' EXIT
+cp -- "${host_keyrings}"/archlinux.gpg "${host_keyrings}"/archlinux-trusted \
+      "${host_keyrings}"/archlinux-revoked "${staging}/"
+cp -- "${host_keyrings}"/cachyos.gpg "${host_keyrings}"/cachyos-trusted \
+      "${host_keyrings}"/cachyos-revoked "${staging}/"
+cp -- "${keyring_src}"/kedra.gpg "${keyring_src}"/kedra-trusted \
+      "${keyring_src}"/kedra-revoked "${staging}/"
+
+msg "Creating build-local pacman keyring at ${KEDRA_ISO_GPGDIR}"
+rm -rf -- "${KEDRA_ISO_GPGDIR}"
+install -d -m 0755 -- "${KEDRA_ISO_GPGDIR}"
+
+pacman-key --gpgdir "${KEDRA_ISO_GPGDIR}" --init
+# shellcheck disable=SC2086 -- KEDRA_ISO_KEYRINGS is an intentional word list.
+pacman-key --gpgdir "${KEDRA_ISO_GPGDIR}" --populate-from "${staging}" \
+	--populate ${KEDRA_ISO_KEYRINGS}
+
+# `pacman-key` has no --with-colons, so inspect the keyring with gpg directly.
+kedra_gpg_list() {
+	gpg --homedir "${KEDRA_ISO_GPGDIR}" --no-permission-warning \
+		--list-keys --with-colons 2>/dev/null
+}
+
+msg "Fully valid user IDs per trust root:"
+for _kr in ${KEDRA_ISO_KEYRINGS}; do
+	printf '    %-10s %s\n' "${_kr}" \
+		"$(kedra_gpg_list | grep -c "^uid:[fu]:.*$(
+			case "${_kr}" in
+				kedra) echo 'Kedra' ;; cachyos) echo 'CachyOS' ;;
+				archlinux) echo '@archlinux\.org' ;;
+			esac)" || true)"
+done
+
+# Presence is not enough: SigLevel = Required needs the key to be FULLY VALID
+# (uid validity 'f' or ultimate 'u'). A key that imported but was never locally
+# signed looks fine in a listing and still fails every signature check.
+kedra_gpg_list | grep -q '^uid:[fu]:.*Kedra' ||
+	die "Kedra trust was NOT established as fully valid in ${KEDRA_ISO_GPGDIR}"
+
+msg "Build keyring ready. The host's /etc/pacman.d/gnupg was not touched."

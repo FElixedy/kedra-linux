@@ -1,0 +1,145 @@
+# Maintainer: Kedra Linux <packages@kedralinux.org>
+
+pkgname=kedra-experience-workflow
+# pkgver IS the module version this package renders, and check() enforces that.
+#
+# WHY IT IS NOT JUST A NUMBER SOMEBODY REMEMBERS TO BUMP
+#
+# This package's entire payload is GENERATED from `_module`'s manifest at build
+# time. So a manifest edit changes the bytes that ship, whether or not anyone
+# thought about the version -- and [kedra] treats published artifacts as
+# immutable, which means republishing changed bytes at an unchanged version is
+# not something to be careful about, it is something that must be impossible.
+#
+# Editing the manifest without bumping the module's `version` now fails the
+# build, here, with the two numbers printed. See _assert_version_matches_module.
+pkgver=0.3.0
+# pkgrel 2: the rendered override is byte-identical -- the 'workflow' module
+# did not change -- but the shipped kedra-workflow.md did, so the package
+# contents differ and the published 0.3.0-1 artifact must not be overwritten.
+# This is exactly what pkgrel is for, and why pkgver is pinned to the module
+# version rather than doubling as a packaging revision.
+pkgrel=2
+pkgdesc="Kedra Workflow v1 keyboard defaults for GNOME (GSettings vendor overrides)"
+arch=('any')
+url="https://github.com/KedraLinux/kedra-packages"
+license=('GPL-3.0-or-later')
+
+# The whole package is one GSettings vendor override file.
+#
+# It is a *defaults* layer, not a configurator: it writes nothing into any
+# user's dconf, so an explicit user value always wins, and `pacman -R` restores
+# upstream GNOME defaults for every key it touches with no revert step and
+# nothing left behind. That removability is the reason the Kedra keymap is
+# packaged separately from kedra-experience instead of shipping with it --
+# Vanilla GNOME must be able to simply not have this package.
+_module=workflow
+_override=95_kedra-experience-workflow.gschema.override
+
+# The schemas whose defaults are overridden. Overriding a key in a schema that
+# is not installed is a hard error from glib-compile-schemas, which would break
+# every *other* package's schemas on the system at hook time -- so these are
+# real runtime dependencies, not optional ones.
+#
+#   org.gnome.desktop.wm.keybindings  -> gsettings-desktop-schemas
+#   org.gnome.shell.keybindings       -> gnome-shell
+depends=('gsettings-desktop-schemas' 'gnome-shell')
+
+# python renders the override from the Experience manifests; glib2 provides
+# glib-compile-schemas for check(). Neither is needed at runtime.
+makedepends=('python')
+checkdepends=('glib2')
+
+# Deliberately NOT a dependency of, or on, kedra-experience. The metadata
+# package describes what a Kedra desktop is; this one delivers one module's
+# defaults. Coupling them would make it impossible to express "Kedra, with
+# Workflow disabled", which is a supported Custom Kedra configuration.
+optdepends=(
+  'kedra-experience: Experience profile and module metadata'
+  'kedra-experience-desktop: Kedra fixed five-workspace model, which Super+1..5 is designed for'
+)
+
+# Monorepo payload: generated from ../kedra-experience/data/experience at build
+# time, so there is nothing to fetch or verify.
+source=()
+sha256sums=()
+
+_datadir() {
+  echo "$startdir/../kedra-experience/data/experience"
+}
+
+_render() {
+  # Renders the override from the module manifests. The manifests are the single
+  # source of truth: this file is never hand-maintained, so a shortcut cannot be
+  # changed in the manifest and missed here.
+  python3 "$startdir/../tools/kedra-experience-dev" \
+    --data-dir "$(_datadir)" \
+    vendor-defaults --module "$_module" --output "$1"
+}
+
+_assert_version_matches_module() {
+  # The mechanical half of the versioning rule stated beside pkgver.
+  #
+  # `module-version` reads the module's declared `version` straight out of the
+  # manifest this package renders, so the comparison is against the authority
+  # rather than against a second copy of the number.
+  local declared
+  declared=$(python3 "$startdir/../tools/kedra-experience-dev" \
+    --data-dir "$(_datadir)" module-version --module "$_module")
+
+  if [[ ${declared} != "${pkgver}" ]]; then
+    echo "==> ERROR: $pkgname is pkgver=${pkgver} but the '$_module' module" >&2
+    echo "           declares version ${declared}." >&2
+    echo "           This package's payload is generated from that manifest, so" >&2
+    echo "           the two must agree: set pkgver=${declared} (and pkgrel=1)." >&2
+    return 1
+  fi
+  echo "$pkgname: pkgver ${pkgver} matches the '$_module' module"
+}
+
+check() {
+  # 0. The package version must still match the module it renders.
+  _assert_version_matches_module
+
+  # 1. The manifests the override is rendered from must be valid.
+  python3 "$startdir/../tools/validate-experience.py" "$(_datadir)"
+
+  # 2. The rendered override must compile against the real installed GNOME
+  #    schemas -- in a scratch directory of our own. Nothing under
+  #    /usr/share/glib-2.0/schemas is written, and no gsettings/dconf value of
+  #    the building user is read or changed.
+  local prefix="$srcdir/schema-check"
+  rm -rf "$prefix"
+  install -d "$prefix"
+
+  # GNOME's own vendor overrides are copied in too, so the precedence this
+  # package depends on is exercised rather than assumed.
+  local sysdir=/usr/share/glib-2.0/schemas
+  if [ -d "$sysdir" ]; then
+    cp "$sysdir"/*.gschema.xml "$sysdir"/*.enums.xml "$sysdir"/*.gschema.override \
+      "$prefix"/ 2>/dev/null || true
+  fi
+
+  _render "$prefix/$_override"
+  glib-compile-schemas --strict "$prefix"
+  echo "kedra-experience-workflow: vendor override compiles cleanly"
+
+  # 3. The tests that guard manifest/override correspondence and the keymap
+  #    itself. Offline: no session, no dconf, no live GSettings.
+  python3 -m unittest discover -s "$startdir/../tests"
+}
+
+package() {
+  install -d "$pkgdir/usr/share/glib-2.0/schemas"
+  _render "$pkgdir/usr/share/glib-2.0/schemas/$_override"
+  chmod 644 "$pkgdir/usr/share/glib-2.0/schemas/$_override"
+
+  # No .install script: glib2 ships an alpm hook that recompiles
+  # /usr/share/glib-2.0/schemas on install, upgrade *and* remove, which is
+  # exactly the "normal Arch packaging mechanism" this package should use. No
+  # compiled gschemas.compiled is shipped -- that file is generated on the
+  # target system and belongs to glib2.
+
+  install -Dm644 "$startdir/../docs/kedra-workflow.md" \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+}

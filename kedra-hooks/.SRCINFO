@@ -1,0 +1,29 @@
+pkgbase = kedra-hooks
+	pkgdesc = Kedra Linux libalpm hooks
+	pkgver = 2026.08.14
+	pkgrel = 1
+	arch = any
+	groups = kedra
+	license = GPL-3.0-or-later
+	depends = systemd
+	provides = cachyos-hooks=2026.02.05
+	conflicts = cachyos-hooks
+	replaces = cachyos-hooks
+	source = kedra-branding
+	source = kedra-branding.hook
+	source = kedra-plymouth-initramfs.hook
+	source = kedra-reboot-required
+	source = kedra-reboot-required.hook
+	source = lsb-release.hook
+	source = os-release.hook
+	source = update-initramfs
+	sha256sums = 09f0eac7e0035c4d73cdbae7223186e104cc33f0f493eca5ae73ab97b282c978
+	sha256sums = e3ccf47dbed603a5cb44f12cebc9fb83582a6a3a5583767db2679a701fe0a5a6
+	sha256sums = 01ac6de277fdf978b3501ba542eb5d41d65aa1e922503b262d91c4b9997086dc
+	sha256sums = 6d0751705c556942a32f6e64e9410f2897c48b0650b00c8882af551c87c61109
+	sha256sums = 1e560fd43f28501b57658355b0e0964ca5bd9b30c3031df978445bf4f90d490d
+	sha256sums = 7aa436f1849f8e7a21748fc551623209b8f566c25b6a4a7abf6b86dd7f1b7c26
+	sha256sums = 8cc1db9b1d39d9f333f4bc103b6714ff6f8797ffc96bc2e0c69ea807a0f9f2d1
+	sha256sums = 1848cd6a7405aa9dcab8b1233fb4aa0dbb00fe3612d8863ac71a522c62daa926
+
+pkgname = kedra-hooks

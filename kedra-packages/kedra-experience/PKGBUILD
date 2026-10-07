@@ -1,0 +1,102 @@
+# Maintainer: Kedra Linux <packages@kedralinux.org>
+
+pkgname=kedra-experience
+# 0.9.0: the `desktop` module became user-selectable (module 0.4.0), which
+# changes what a Custom Kedra may express. See modules/desktop.toml.
+pkgver=0.9.0
+pkgrel=1
+pkgdesc="Kedra Experience profile and module metadata, and the Kedra terminal shortcut declaration"
+arch=('any')
+url="https://github.com/KedraLinux/kedra-packages"
+license=('GPL-3.0-or-later')
+
+# Read-only metadata. It describes what a Kedra desktop is composed of; it does
+# not itself configure GNOME, so it depends on nothing at runtime. Modules
+# declare their own package relationships inside the manifests, and those are
+# resolved by tooling, not by pacman.
+#
+# This stays empty even though the tree now declares a `policy = "managed"`
+# setting. The package ships manifests and documentation; the tooling that would
+# apply that setting is not in it, and PyGObject is imported lazily by the
+# adapter so nothing here needs GLib at runtime.
+depends=()
+
+# python validates the manifests and runs the suite during check().
+#
+# The rest exist so the *real*-GSettings integration tests actually run at build
+# time rather than skipping. They exercise the production adapter against the
+# genuine gnome-settings-daemon schemas -- compiled into a temporary directory --
+# through a keyfile backend in a temporary directory, so nothing of the building
+# user's is read or written. Without them the tests skip themselves and the
+# adapter would be built untested; see docs/kedra-terminal.md.
+#
+#   python-gobject         Gio.Settings, via PyGObject
+#   glib2                  glib-compile-schemas
+#   gnome-settings-daemon  the media-keys schemas the terminal shortcut targets
+#   gnome-console          the desktop file whose DBusActivatable flag the
+#                          derived launch command depends on
+#   gtk4                   gtk_accelerator_parse, the authority on accelerator
+#                          equivalence. Without it the conflict tests skip, and
+#                          a shortcut whose conflict status is unknown is
+#                          blocked rather than registered -- so a build that
+#                          skipped them would not have exercised the check that
+#                          keeps Kedra off somebody else's Super+Enter.
+checkdepends=(
+  'python' 'python-gobject' 'glib2' 'gnome-settings-daemon' 'gnome-console' 'gtk4'
+)
+
+# Branding is a replaceable provider referenced by the appearance and
+# integration modules. It is deliberately NOT a dependency: the Experience
+# layer must remain functional without it, and this package ships no assets.
+optdepends=(
+  'kedra-branding: Kedra branding assets'
+  'kedra-experience-runtime: the kedra-experience command, which resolves profiles from this tree'
+)
+
+# NOT a dependency on kedra-experience-runtime, deliberately, even though the
+# `integration` module names both as required packages of a Kedra profile.
+#
+# The relation runs the other way: the runtime cannot work without this tree and
+# depends on it, while this tree is inert data that is perfectly meaningful on a
+# machine with no resolver installed -- a build host, or a system being
+# inspected. Making the dependency mutual would also make the pair impossible to
+# install in a sensible order for no gain.
+
+# The payload lives beside this PKGBUILD in the kedra-packages monorepo rather
+# than in a release tarball, so there is nothing to fetch or verify.
+source=()
+sha256sums=()
+
+check() {
+  python3 "$startdir/../tools/validate-experience.py" "$startdir/data/experience"
+  python3 "$startdir/../tools/validate-experience.py" "$startdir/../docs/examples/custom-kedra.toml"
+
+  # The documented user-state example is checked here too, so a change to the
+  # state model that invalidates it fails the build rather than the docs
+  # quietly going stale. Read-only: nothing under $HOME is touched.
+  python3 "$startdir/../tools/kedra-experience-dev" \
+    --data-dir "$startdir/data/experience" \
+    validate-state "$startdir/../docs/examples/user-state.toml"
+
+  python3 -m unittest discover -s "$startdir/../tests"
+}
+
+package() {
+  local datadir="$pkgdir/usr/share/kedra/experience"
+  install -d "$datadir/presets" "$datadir/modules"
+
+  install -Dm644 "$startdir/data/experience/experience.toml" "$datadir/experience.toml"
+  install -Dm644 "$startdir/data/experience/presets/"*.toml -t "$datadir/presets"
+  install -Dm644 "$startdir/data/experience/modules/"*.toml -t "$datadir/modules"
+
+  install -Dm644 "$startdir/../docs/kedra-experience.md" \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+
+  # Kedra Terminal ships no GSettings override and therefore has no defaults
+  # package of its own to carry its documentation. Its one written setting --
+  # the Super+Enter shortcut -- is a `managed` declaration in the manifests this
+  # package installs, not a file, so the manual belongs here too, beside the
+  # manifest it explains.
+  install -Dm644 "$startdir/../docs/kedra-terminal.md" \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+}

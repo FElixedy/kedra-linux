@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+#
+# kedra-verify-target -- assert that the installed system is actually a Kedra
+# system, before the installer tells the user it succeeded.
+#
+# Runs CHROOTED in the target, at the end of the install sequence.
+#
+# WHY THIS EXISTS
+# ---------------
+# Every failure this checks for is silent. A target can finish installing, boot,
+# present a desktop, and still be wrong in ways the user only discovers later:
+#
+#   * kedra-keyring's install scriptlet guards itself with `pacman-key -l` and
+#     does nothing if that fails -- which is what happens when /proc is not
+#     mounted in the target. Result: an installed system that cannot verify
+#     [kedra] and breaks on its first update.
+#   * `pacman-conf` resolves `Include =` paths against the filesystem it runs on.
+#     A dangling include is not a hard error everywhere, but it silently drops a
+#     repository, and it has already broken Kedra keyring bootstrap once.
+#   * `pacman -Q cachyos-hooks` succeeds on a correct Kedra system, because
+#     kedra-hooks provides that name. Only the local database distinguishes a
+#     provides-resolution from an actually-installed cachyos-hooks.
+#   * A [kedra] entry can be present and completely dead, if it points at a path
+#     that only existed on the live medium.
+#
+# Failing here is the point: a loud installer failure is recoverable, an installed
+# system that cannot verify its own packages is not.
+
+set -uo pipefail
+
+# Calamares does not capture stderr from shellprocess jobs.
+exec 2>&1
+
+readonly REPO=kedra
+# Kedra's trust root, as shipped in kedra-keyring/kedra-trusted.
+readonly KEDRA_KEY_FPR=631030A438B1A866278D8C2D1E9618DF1CE116BC
+
+failures=0
+
+ok()   { printf '  [ ok ] %s\n' "$*"; }
+bad()  { printf '  [FAIL] %s\n' "$*"; failures=$((failures + 1)); }
+note() { printf '         %s\n' "$*"; }
+
+printf '==> verifying the installed Kedra system\n'
+
+# --- identity ---------------------------------------------------------------
+# kedra-hooks is the sole owner of /etc/os-release; it is written by a libalpm
+# hook during package installation, so its absence means the hook never ran.
+if [[ -r /etc/os-release ]]; then
+	id=$(sed -n 's/^ID=//p' /etc/os-release)
+	name=$(sed -n 's/^NAME=//p' /etc/os-release | tr -d '"')
+	[[ ${id} == kedra ]] && ok "os-release ID=kedra" || bad "os-release ID is '${id}', expected kedra"
+	[[ ${name} == "Kedra Linux" ]] && ok "os-release NAME=\"Kedra Linux\"" ||
+		bad "os-release NAME is '${name}', expected 'Kedra Linux'"
+else
+	bad "/etc/os-release is missing"
+fi
+
+# --- Kedra packages ---------------------------------------------------------
+for pkg in kedra-hooks kedra-keyring; do
+	if ver=$(pacman -Qq "${pkg}" 2>/dev/null) && [[ -n ${ver} ]]; then
+		ok "${pkg} is installed"
+	else
+		bad "${pkg} is NOT installed"
+	fi
+done
+
+# Deliberately reads the local database directory rather than asking pacman:
+# `pacman -Q cachyos-hooks` resolves through kedra-hooks' `provides` and would
+# report success on a perfectly correct system.
+if compgen -G '/var/lib/pacman/local/cachyos-hooks-*' >/dev/null; then
+	bad "a package literally named cachyos-hooks is installed in the local database"
+	note "$(printf '%s\n' /var/lib/pacman/local/cachyos-hooks-*)"
+else
+	ok "no local package entry named cachyos-hooks"
+fi
+
+# --- signature enforcement --------------------------------------------------
+# Checked against the effective configuration, not by grepping the file, so an
+# override in any section is caught.
+siglevel=$(pacman-conf SigLevel 2>/dev/null | tr '\n' ' ')
+if [[ ${siglevel} == *Never* || ${siglevel} == *never* ]]; then
+	bad "SigLevel contains Never: ${siglevel}"
+else
+	ok "signature verification is enforced (${siglevel% })"
+fi
+for r in $(pacman-conf --repo-list 2>/dev/null); do
+	rsig=$(pacman-conf --repo "${r}" SigLevel 2>/dev/null | tr '\n' ' ')
+	if [[ ${rsig} == *Never* ]]; then
+		bad "[${r}] disables signature verification: ${rsig}"
+	fi
+done
+
+# --- pacman includes actually exist -----------------------------------------
+missing_includes=0
+while read -r inc; do
+	[[ -n ${inc} ]] || continue
+	if [[ ! -r ${inc} ]]; then
+		bad "pacman.conf references a missing Include file: ${inc}"
+		missing_includes=$((missing_includes + 1))
+	fi
+done < <(sed -n 's/^[[:space:]]*Include[[:space:]]*=[[:space:]]*//p' /etc/pacman.conf)
+(( missing_includes == 0 )) && ok "every Include in pacman.conf resolves"
+
+# --- Kedra trust ------------------------------------------------------------
+# The package files being present is not trust. This is trust.
+if pacman-key --list-keys "${KEDRA_KEY_FPR}" >/dev/null 2>&1; then
+	ok "the Kedra signing key is in the target pacman keyring"
+	if gpg --homedir /etc/pacman.d/gnupg --no-permission-warning --batch --no-tty \
+		--list-keys --with-colons "${KEDRA_KEY_FPR}" 2>/dev/null |
+		grep -q '^uid:[fu]:'; then
+		ok "the Kedra signing key is fully trusted"
+	else
+		bad "the Kedra signing key is present but NOT fully trusted"
+		note "SigLevel = Required needs a fully valid key; this target cannot verify [${REPO}]"
+	fi
+else
+	bad "the Kedra signing key ${KEDRA_KEY_FPR} is NOT in the target pacman keyring"
+	note "kedra-keyring's scriptlet did not populate it -- check that /proc was mounted in the target"
+fi
+
+# --- [kedra] is configured, alive, and authoritative ------------------------
+if kserver=$(pacman-conf --repo "${REPO}" Server 2>/dev/null | head -n1) && [[ -n ${kserver} ]]; then
+	ok "[${REPO}] is configured: ${kserver}"
+	if [[ ${kserver} == file://* ]]; then
+		kdir=${kserver#file://}
+		if [[ -d ${kdir} && -f ${kdir}/${REPO}.db ]]; then
+			ok "the [${REPO}] snapshot exists on the installed disk (${kdir})"
+		else
+			bad "[${REPO}] points at ${kdir}, which does not exist in the installed system"
+			note "this would be a dead repository on first boot"
+		fi
+	fi
+else
+	bad "the installed system has no [${REPO}] repository"
+fi
+
+# Resolution, not just configuration: which repository does the target actually
+# get kedra-hooks from? The sync databases were populated during pacstrap.
+if origin=$(pacman -Si kedra-hooks 2>/dev/null | sed -n 's/^Repository[[:space:]]*:[[:space:]]*//p' | head -n1) &&
+	[[ -n ${origin} ]]; then
+	[[ ${origin} == "${REPO}" ]] && ok "kedra-hooks resolves from [${origin}]" ||
+		bad "kedra-hooks resolves from [${origin}], expected [${REPO}]"
+else
+	bad "the target cannot resolve kedra-hooks from any repository"
+fi
+
+# --- the CachyOS layer is still there --------------------------------------
+# Kedra reuses CachyOS kernels and performance settings; losing them to a
+# branding change would be a regression, so it is asserted rather than assumed.
+for pkg in cachyos-keyring cachyos-settings chwd; do
+	pacman -Qq "${pkg}" >/dev/null 2>&1 && ok "${pkg} is installed" ||
+		bad "${pkg} is NOT installed -- the CachyOS layer is incomplete"
+done
+if pacman -Qq linux-cachyos >/dev/null 2>&1; then
+	ok "linux-cachyos is installed"
+else
+	bad "linux-cachyos is NOT installed"
+fi
+if compgen -G '/boot/vmlinuz-linux-cachyos*' >/dev/null; then
+	ok "a CachyOS kernel image is present in /boot"
+else
+	bad "no vmlinuz-linux-cachyos* in /boot -- the target has no kernel to boot"
+fi
+
+# --- Kedra Experience -------------------------------------------------------
+# Only what is knowable from a chroot, BEFORE anyone has logged in.
+#
+# Super+Enter is deliberately not checked here and cannot be: it is written into
+# a user's dconf by their own session on first login, and a chroot has no
+# session to write it from. Asserting it here would mean either testing nothing
+# or inventing the very fake session this architecture refuses. It belongs to a
+# post-login acceptance test.
+#
+# What IS knowable is whether the pieces that make first login work are present
+# and consistent with each other -- and, most importantly, that the installer
+# has not fabricated an [applied] record for work it never did.
+readonly EXPERIENCE_STATE_REL=.local/state/kedra/experience-state.toml
+readonly ACTIVATION_UNIT=/usr/lib/systemd/user/kedra-experience-activate.service
+
+# Which homes carry a chosen profile. Presence of this file -- not presence of a
+# package -- is what makes a system a Kedra Experience system.
+experience_homes=()
+for home in /home/*; do
+	[[ -d ${home} ]] || continue
+	[[ -f ${home}/${EXPERIENCE_STATE_REL} ]] && experience_homes+=("${home}")
+done
+
+installed() { pacman -Qq -- "$1" >/dev/null 2>&1; }
+
+if (( ${#experience_homes[@]} == 0 )); then
+	ok "no Kedra Experience state: this is a Vanilla target"
+
+	# Vanilla must not have received the behaviour packages. These are the
+	# GSettings vendor overrides; their mere presence changes the desktop, with
+	# no configuration to undo and nothing in dconf to point at.
+	for pkg in kedra-experience-desktop kedra-experience-workflow; do
+		installed "${pkg}" &&
+			bad "${pkg} is installed on a target with no Experience profile" ||
+			ok "${pkg} is absent"
+	done
+
+	if compgen -G '/usr/share/glib-2.0/schemas/95_kedra-experience-*' >/dev/null; then
+		bad "a Kedra GSettings vendor override is installed on a Vanilla target"
+		note "$(printf '%s\n' /usr/share/glib-2.0/schemas/95_kedra-experience-*)"
+	else
+		ok "no Kedra GSettings vendor override is installed"
+	fi
+
+	# The activation unit is harmless without state -- its own
+	# ConditionPathExists sees to that -- so this is a consistency check rather
+	# than a failure of isolation.
+	[[ -f ${ACTIVATION_UNIT} ]] &&
+		note "the activation unit is present but no user has a profile; it will not run" ||
+		ok "no Experience activation unit is installed"
+else
+	ok "${#experience_homes[@]} user(s) have a Kedra Experience profile"
+
+	# The metadata and the resolver must both be there: the first is the tree
+	# every profile decision is read from, the second is what reads it on first
+	# login. Without either, the state file is a note nobody will act on.
+	for pkg in kedra-experience kedra-experience-runtime; do
+		installed "${pkg}" && ok "${pkg} is installed" ||
+			bad "${pkg} is NOT installed, so the recorded profile can never be applied"
+	done
+
+	[[ -f ${ACTIVATION_UNIT} ]] &&
+		ok "the first-login activation unit is installed" ||
+		bad "no activation unit at ${ACTIVATION_UNIT}; the profile would never be applied"
+
+	# Enabled by a package-owned wants symlink rather than a scriptlet, so it
+	# works for users who did not exist at install time.
+	if [[ -L /usr/lib/systemd/user/graphical-session.target.wants/kedra-experience-activate.service ]]; then
+		ok "the activation unit is wanted by graphical-session.target"
+	else
+		bad "the activation unit is installed but nothing pulls it into the session"
+	fi
+
+	for home in "${experience_homes[@]}"; do
+		state="${home}/${EXPERIENCE_STATE_REL}"
+		user=${home##*/}
+
+		# THE assertion of this section. An installer applies nothing, so it must
+		# claim nothing: a fabricated [applied] block would be read on first login
+		# as "Kedra already set these values", and the ownership layer would then
+		# preserve user changes that never happened -- permanently, and silently.
+		if grep -q '^\[applied\]' "${state}"; then
+			bad "${user}: the state file already claims applied state before first login"
+			note "an installer applies nothing; [applied] must not exist yet"
+		else
+			ok "${user}: no applied state is claimed before first login"
+		fi
+
+		grep -q '^\[selection\]' "${state}" &&
+			ok "${user}: the state file records a selection" ||
+			bad "${user}: the state file has no [selection] table"
+
+		base=$(sed -n 's/^base_preset[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "${state}" | head -n1)
+		[[ -n ${base} ]] &&
+			ok "${user}: profile base_preset = ${base}" ||
+			bad "${user}: the state file names no base preset"
+
+		# A state file the user cannot write is one their own session cannot
+		# update on first login.
+		owner=$(stat -c '%U' "${state}" 2>/dev/null)
+		[[ ${owner} == "${user}" ]] &&
+			ok "${user}: the state file belongs to them" ||
+			bad "${user}: the state file is owned by '${owner:-unknown}'"
+	done
+fi
+
+# --- verdict ----------------------------------------------------------------
+printf '\n'
+if (( failures )); then
+	printf '==> ERROR: %d Kedra verification check(s) failed.\n' "${failures}"
+	printf '==> Refusing to report a successful installation.\n'
+	exit 1
+fi
+printf '==> the installed system is a valid Kedra system\n'

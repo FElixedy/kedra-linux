@@ -1,0 +1,60 @@
+# Maintainer: Kedra Linux
+# Based on cachyos-hooks by:
+#   Piotr Górski <lucjan.lucjanov@gmail.com>
+#   Vasiliy Stelmachenok <ventureo@cachyos.org>
+#   Michael Bolden <me@sm9.dev>
+
+pkgname=kedra-hooks
+pkgver=2026.08.14
+pkgrel=1
+pkgdesc='Kedra Linux libalpm hooks'
+groups=('kedra')
+depends=('systemd')
+arch=('any')
+license=(GPL-3.0-or-later)
+# url= is intentionally unset until the Kedra upstream repository location is decided.
+
+# kedra-hooks owns the distro identity files. cachyos-hooks rewrites the same
+# files back to CachyOS on every relevant update and also ships
+# /usr/bin/update-initramfs, so the two can never be co-installed.
+conflicts=('cachyos-hooks')
+replaces=('cachyos-hooks')
+# kedra-hooks takes over the whole package contract (identity hooks,
+# update-initramfs, reboot notifications), so anything depending on
+# cachyos-hooks stays satisfiable. Without this, such a package is
+# uninstallable on Kedra: pacman pulls cachyos-hooks in and hits `conflicts`.
+# The version tracks the upstream cachyos-hooks release this fork is based on;
+# bump it when rebasing, otherwise versioned dependencies are not satisfied.
+_cachyos_hooks_base=2026.02.05
+provides=("cachyos-hooks=${_cachyos_hooks_base}")
+
+# Upstream builds from a git tag; until the Kedra repository exists, the sources
+# are taken from this directory. Switch back to a `git+<url>#tag=$pkgver` source
+# (plus `makedepends=('git')` and a `cd "$pkgname"` in package()) once it does.
+source=('kedra-branding'
+        'kedra-branding.hook'
+        'kedra-plymouth-initramfs.hook'
+        'kedra-reboot-required'
+        'kedra-reboot-required.hook'
+        'lsb-release.hook'
+        'os-release.hook'
+        'update-initramfs')
+sha256sums=('09f0eac7e0035c4d73cdbae7223186e104cc33f0f493eca5ae73ab97b282c978'
+            'e3ccf47dbed603a5cb44f12cebc9fb83582a6a3a5583767db2679a701fe0a5a6'
+            '01ac6de277fdf978b3501ba542eb5d41d65aa1e922503b262d91c4b9997086dc'
+            '6d0751705c556942a32f6e64e9410f2897c48b0650b00c8882af551c87c61109'
+            '1e560fd43f28501b57658355b0e0964ca5bd9b30c3031df978445bf4f90d490d'
+            '7aa436f1849f8e7a21748fc551623209b8f566c25b6a4a7abf6b86dd7f1b7c26'
+            '8cc1db9b1d39d9f333f4bc103b6714ff6f8797ffc96bc2e0c69ea807a0f9f2d1'
+            '1848cd6a7405aa9dcab8b1233fb4aa0dbb00fe3612d8863ac71a522c62daa926')
+
+package() {
+  install -Dm644 kedra-branding.hook "$pkgdir/usr/share/libalpm/hooks/kedra-branding.hook"
+  install -Dm644 kedra-plymouth-initramfs.hook "$pkgdir/usr/share/libalpm/hooks/kedra-plymouth-initramfs.hook"
+  install -Dm644 kedra-reboot-required.hook "$pkgdir/usr/share/libalpm/hooks/kedra-reboot-required.hook"
+  install -Dm644 lsb-release.hook "$pkgdir/usr/share/libalpm/hooks/lsb-release.hook"
+  install -Dm644 os-release.hook "$pkgdir/usr/share/libalpm/hooks/os-release.hook"
+  install -Dm755 kedra-branding "$pkgdir/usr/share/libalpm/scripts/kedra-branding"
+  install -Dm755 kedra-reboot-required "$pkgdir/usr/share/libalpm/scripts/kedra-reboot-required"
+  install -Dm755 update-initramfs "$pkgdir/usr/bin/update-initramfs"
+}

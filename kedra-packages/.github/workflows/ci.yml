@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  manifests:
+    name: Validate Experience manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # tomllib requires 3.11+; the validator uses nothing else.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate shipped manifests
+        run: python3 tools/validate-experience.py
+
+      - name: Validate documented preset example
+        run: python3 tools/validate-experience.py docs/examples/custom-kedra.toml
+
+      - name: Validate documented user-state example
+        run: python3 tools/kedra-experience-dev validate-state docs/examples/user-state.toml
+
+      - name: Resolve the shipped presets
+        run: |
+          python3 tools/kedra-experience-dev resolve --preset kedra --format json
+          python3 tools/kedra-experience-dev resolve --preset vanilla --format json
+
+      - name: Plan against the documented example (no session, fixtures only)
+        run: |
+          python3 tools/kedra-experience-dev plan docs/examples/user-state.toml --format json
+
+      - name: Render every module's vendor defaults (to stdout; writes nothing)
+        run: |
+          python3 tools/kedra-experience-dev vendor-defaults --list
+          python3 tools/kedra-experience-dev vendor-defaults
+
+      - name: Resolve the package set for each product
+        run: |
+          python3 tools/kedra-experience-dev packages --preset vanilla --format json
+          python3 tools/kedra-experience-dev packages --preset kedra --format json
+
+      - name: Show the application contracts and their derived launch commands
+        run: |
+          python3 tools/kedra-experience-dev applications --preset vanilla --format json
+          python3 tools/kedra-experience-dev applications --preset kedra --format json
+
+      # Expands the Super+Enter shortcut into the four settings it is made of.
+      # Read-only: it opens no GSettings and applies nothing, which is why it is
+      # safe to run on a runner with no desktop at all.
+      - name: Expand the custom-shortcut resources
+        run: |
+          python3 tools/kedra-experience-dev shortcuts --preset vanilla
+          python3 tools/kedra-experience-dev shortcuts --preset kedra --format json
+
+      # The SHIPPED command, exercised exactly as an installer would call it.
+      # --data-dir points at the in-tree manifests because nothing is installed
+      # on a runner; the packaged form is covered by tests/test_installed_layout.py,
+      # which runs the real /usr/bin/kedra-experience with no checkout reachable.
+      - name: Query profiles through the shipped CLI
+        run: |
+          tools/kedra-experience --data-dir kedra-experience/data/experience \
+            profiles --format json
+
+      - name: Resolve each product through the shipped CLI
+        run: |
+          data=kedra-experience/data/experience
+          for selection in \
+            '{"base_preset":"vanilla"}' \
+            '{"base_preset":"kedra"}' \
+            '{"base_preset":"kedra","module_overrides":[{"id":"workflow","enabled":false}]}'
+          do
+            echo "$selection" |
+              tools/kedra-experience --data-dir "$data" resolve --selection -
+          done
+
+      # Vanilla isolation, asserted in CI rather than only in the suite: the
+      # required set must be empty and the layer must not apply.
+      - name: Prove Vanilla requires no package
+        run: |
+          echo '{"base_preset":"vanilla"}' |
+            tools/kedra-experience --data-dir kedra-experience/data/experience \
+              resolve --selection - |
+            python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d["applies_experience_layer"] is False, d
+          assert d["packages"]["required"] == [], d["packages"]
+          assert d["modules"] == [], d["modules"]
+          assert d["applications"] == [], d["applications"]
+          print("vanilla: no layer, no packages, no contracts")
+          '
+
+      # Accelerator conflicts, against a fixture. On this runner GTK is absent,
+      # so the report says *unavailable* and the shortcut is blocked -- which is
+      # the conservative answer, and exactly what must happen when the
+      # authoritative parser cannot be consulted. Exit status 1 is therefore the
+      # expected outcome here, not a failure.
+      - name: Report accelerator conflicts (fixture only; no session)
+        run: |
+          python3 tools/kedra-experience-dev shortcut-conflicts \
+            docs/examples/user-state.toml --format json || true
+
+      # NOTE: two groups of tests skip themselves on this runner, both because
+      # it has no GNOME.
+      #
+      # The override's compilation against real GNOME schemas: the schemas it
+      # overrides do not exist here, so glib-compile-schemas would rightly
+      # reject it.
+      #
+      # The real-GSettings integration tests (tests/test_gsettings_adapter.py
+      # and tests/test_gsettings_conflicts.py): they need PyGObject,
+      # glib-compile-schemas, the gnome-settings-daemon schemas and GTK, and
+      # compile a copy of those schemas into a temporary directory.
+      #
+      # Both run on a GNOME machine and in the affected packages' check(), which
+      # list them as checkdepends precisely so the build exercises them.
+      # Everything that does not need GNOME -- rendering, manifest/override
+      # correspondence, the keymap, the clash rules, the shortcut resource, the
+      # ownership decisions and the executor -- runs unconditionally below.
+
+      - name: Run test suite
+        run: python3 -m unittest discover -s tests -v

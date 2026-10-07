@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = kedra-hooks
+
+[Action]
+Description = Updating Kedra specific configuration.
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/kedra-branding

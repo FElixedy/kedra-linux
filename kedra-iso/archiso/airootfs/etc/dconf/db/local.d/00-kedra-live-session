@@ -1,0 +1,23 @@
+# Kedra live session behaviour.
+#
+# This is the GNOME equivalent of the Plasma settings the upstream CachyOS
+# profile shipped (etc/skel/.config/kscreenlockerrc and powerdevilrc). It is
+# live-medium behaviour, NOT Kedra theming or Kedra Experience -- nothing here
+# sets a font, a wallpaper, an icon theme or an extension.
+#
+# The live user has an empty password, so a screen lock would be an unlockable
+# dead end, and suspending part-way through an installation would be worse. Both
+# are therefore disabled for the live session only; an installed Kedra system
+# gets the ordinary GNOME defaults.
+
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+idle-activation-enabled=false
+
+[org/gnome/desktop/session]
+# 0 = never blank the screen.
+idle-delay=uint32 0
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'

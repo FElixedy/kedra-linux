@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+kedra-vmctl -- drive a long-lived QEMU/KVM guest for the Kedra installation test.
+
+kedra-iso-testvm boots the live ISO, runs one check script and shuts down. A real
+installation cannot work that way: Calamares is a GUI application, the run takes
+tens of minutes, and the same machine has to be rebooted afterwards from its
+installed disk. So this tool keeps ONE VM alive across many invocations and
+exposes the three channels needed to use it:
+
+  QMP  -- screenshots, keyboard and absolute pointer input, reset, quit
+  QGA  -- shell commands inside the guest (live ISO and installed system alike)
+  disk -- a persistent raw image that survives ISO detach and reboot
+
+Nothing about the ISO is modified for testing. Input is delivered as real
+keyboard/tablet events, so Calamares is driven exactly as a user drives it.
+
+  kedra-vmctl start --iso ISO --disk IMG   boot with the ISO attached
+  kedra-vmctl start --disk IMG             boot from the disk only (cold boot)
+  kedra-vmctl shot TAG                     screenshot -> outdir/screen-TAG.png
+  kedra-vmctl click X Y                    left click at framebuffer pixel X,Y
+  kedra-vmctl key K [K...]                 press qcodes, e.g. `key tab tab ret`
+  kedra-vmctl type 'text'                  type a literal string
+  kedra-vmctl sh 'command'                 run a shell command via the agent
+  kedra-vmctl wait-agent [--timeout N]     block until the agent answers
+  kedra-vmctl size                         report the guest framebuffer size
+  kedra-vmctl stop                         graceful powerdown, then quit
+"""
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+OVMF_CODE = "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+OVMF_VARS = "/usr/share/edk2/x64/OVMF_VARS.4m.fd"
+DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "installvm-out")
+
+
+def log(msg):
+    print(f"\033[1;34m==>\033[0m {msg}", flush=True)
+
+
+class Sock:
+    """Line-delimited JSON over a unix socket (QMP and QGA both speak it)."""
+
+    def __init__(self, path, timeout=15):
+        self.buf = b""
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+        self.s.connect(path)
+
+    def send(self, obj):
+        self.s.sendall(json.dumps(obj).encode() + b"\n")
+
+    def recv(self, timeout=15):
+        self.s.settimeout(timeout)
+        while b"\n" not in self.buf:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise EOFError("socket closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        line = line.replace(b"\xff", b"").strip()
+        return json.loads(line) if line else {}
+
+    def command(self, name, timeout=20, **args):
+        msg = {"execute": name}
+        if args:
+            msg["arguments"] = args
+        self.send(msg)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            reply = self.recv(timeout=max(1, deadline - time.time()))
+            if "error" in reply:
+                raise RuntimeError(f"{name}: {reply['error']}")
+            if "return" in reply:
+                return reply["return"]
+        raise TimeoutError(name)
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def qmp(out):
+    q = Sock(os.path.join(out, "qmp.sock"))
+    q.recv()                      # greeting
+    q.command("qmp_capabilities")
+    return q
+
+
+def qga(out, timeout=600):
+    """Connect and resynchronise with the guest agent."""
+    path = os.path.join(out, "qga.sock")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            a = Sock(path, timeout=5)
+            token = int(time.time() * 1000) & 0x7FFFFFFF
+            a.s.sendall(b"\xff")
+            a.send({"execute": "guest-sync-delimited", "arguments": {"id": token}})
+            end = time.time() + 8
+            while time.time() < end:
+                try:
+                    if a.recv(timeout=4).get("return") == token:
+                        return a
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                except socket.timeout:
+                    break
+            a.close()
+        except (OSError, EOFError, TimeoutError, ValueError):
+            pass
+        time.sleep(3)
+    return None
+
+
+def qga_run(a, cmd, timeout=1800):
+    """Run a shell command in the guest, returning (rc, stdout, stderr)."""
+    pid = a.command(
+        "guest-exec", path="/bin/bash", arg=["-lc", cmd],
+        **{"capture-output": True},
+    )["pid"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = a.command("guest-exec-status", timeout=60, pid=pid)
+        if st.get("exited"):
+            return (
+                st.get("exitcode", -1),
+                base64.b64decode(st.get("out-data", "")).decode("utf-8", "replace"),
+                base64.b64decode(st.get("err-data", "")).decode("utf-8", "replace"),
+            )
+        time.sleep(2)
+    raise TimeoutError(f"guest command timed out: {cmd}")
+
+
+# --- input -----------------------------------------------------------------
+# QEMU's absolute pointer axis range is fixed at 0..32767 regardless of the
+# guest's resolution, so pixel coordinates have to be scaled by the current
+# framebuffer size. That size is read back from a screenshot rather than assumed.
+ABS_MAX = 32767
+
+SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal", "{": "bracket_left",
+    "}": "bracket_right", ":": "semicolon", '"': "apostrophe", "<": "comma",
+    ">": "dot", "?": "slash", "|": "backslash", "~": "grave_accent",
+}
+PLAIN = {
+    " ": "spc", "-": "minus", "=": "equal", "[": "bracket_left",
+    "]": "bracket_right", ";": "semicolon", "'": "apostrophe", ",": "comma",
+    ".": "dot", "/": "slash", "\\": "backslash", "`": "grave_accent",
+    "\n": "ret", "\t": "tab",
+}
+
+
+def char_to_keys(ch):
+    if ch.isdigit():
+        return [ch], False
+    if ch.isalpha():
+        return [ch.lower()], ch.isupper()
+    if ch in PLAIN:
+        return [PLAIN[ch]], False
+    if ch in SHIFTED:
+        return [SHIFTED[ch]], True
+    raise ValueError(f"cannot type character {ch!r}")
+
+
+def fb_size(out):
+    """Framebuffer size, via a throwaway screendump."""
+    q = qmp(out)
+    tmp = os.path.join(out, ".size.ppm")
+    try:
+        q.command("screendump", timeout=60, filename=tmp)
+        with open(tmp, "rb") as fh:
+            head = fh.read(64).split()
+        return int(head[1]), int(head[2])
+    finally:
+        q.close()
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def do_start(args):
+    out = args.outdir
+    os.makedirs(out, exist_ok=True)
+
+    if not os.path.exists(args.disk):
+        # A sparse raw image: qemu-img is in a separate package and is not needed
+        # for raw, so the harness does not depend on it being installed.
+        with open(args.disk, "wb") as fh:
+            fh.truncate(args.disk_size * 1024 * 1024 * 1024)
+        log(f"created blank disk {args.disk} ({args.disk_size} GiB, sparse)")
+
+    vars_copy = os.path.join(out, "OVMF_VARS.fd")
+    # Preserve the firmware's boot entries across restarts -- the installed system
+    # needs the NVRAM entry efibootmgr wrote during installation. Only recreate on
+    # an explicitly fresh run.
+    if args.fresh_nvram or not os.path.exists(vars_copy):
+        shutil.copyfile(OVMF_VARS, vars_copy)
+        log("reset OVMF NVRAM")
+
+    for name in ("qmp.sock", "qga.sock"):
+        p = os.path.join(out, name)
+        if os.path.exists(p):
+            os.unlink(p)
+
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    have = subprocess.run(["qemu-system-x86_64", "-device", "help"],
+                          capture_output=True, text=True, check=False).stdout
+    gpu = (["-device", "virtio-gpu-pci", "-vga", "none"]
+           if "virtio-gpu-pci" in have else ["-vga", "std"])
+
+    cmd = [
+        "qemu-system-x86_64",
+        "-name", "kedra-install-test",
+        "-machine", "q35" + (",accel=kvm" if kvm else ",accel=tcg"),
+        "-cpu", "host" if kvm else "qemu64",
+        "-smp", args.cpus, "-m", args.memory,
+        "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={OVMF_CODE}",
+        "-drive", f"if=pflash,format=raw,unit=1,file={vars_copy}",
+        # The target disk. virtio-blk, raw, persistent.
+        "-drive", f"file={args.disk},format=raw,if=none,id=hd0,cache=writeback",
+        "-device", "virtio-blk-pci,drive=hd0,bootindex=1",
+        *gpu,
+        "-netdev", "user,id=net0",
+        "-device", "virtio-net-pci,netdev=net0",
+        "-device", "virtio-rng-pci",
+        # Absolute pointer, so a click can be aimed at a pixel from a screenshot.
+        # A relative PS/2 mouse cannot be aimed at all without tracking state.
+        "-device", "qemu-xhci,id=xhci",
+        "-device", "usb-tablet,bus=xhci.0",
+        "-device", "virtio-serial",
+        "-chardev", f"socket,path={os.path.join(out, 'qga.sock')},server=on,wait=off,id=qga0",
+        "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+        "-qmp", f"unix:{os.path.join(out, 'qmp.sock')},server=on,wait=off",
+        "-serial", f"file:{os.path.join(out, 'serial.log')}",
+        "-display", "none",
+    ]
+    if args.iso:
+        cmd += [
+            "-drive", f"file={args.iso},media=cdrom,readonly=on,if=none,id=cd0",
+            "-device", "ide-cd,drive=cd0,bootindex=0",
+            "-boot", "order=dc,menu=off",
+        ]
+        log(f"booting with ISO attached: {os.path.basename(args.iso)}")
+    else:
+        cmd += ["-boot", "order=c,menu=off"]
+        log("booting from the installed disk only (no ISO attached)")
+
+    # DETACHING FROM THE INVOKING SESSION
+    # ----------------------------------
+    # start_new_session alone is not enough. QEMU stays in the caller's systemd
+    # session scope, so when that session ends -- a terminal closing, a task
+    # runner reaping its process tree -- the user manager sends SIGTERM to
+    # everything still in it. An installation takes half an hour, which is long
+    # enough for that to happen, and it did: "terminating on signal 15 from
+    # pid 861 (/usr/lib/systemd/systemd)" arrived mid-pacstrap.
+    #
+    # --detach runs QEMU as a transient systemd user SERVICE instead. A service
+    # is its own unit with its own cgroup, owned by the user manager rather than
+    # by whatever shell happened to start it, so it outlives the caller. It needs
+    # lingering enabled (loginctl enable-linger) to survive a full logout.
+    if args.detach and shutil.which("systemd-run"):
+        unit = args.unit
+        subprocess.run(["systemctl", "--user", "reset-failed", unit],
+                       capture_output=True, check=False)
+        wrapper = [
+            "systemd-run", "--user", "--unit", unit, "--collect",
+            "--same-dir", "--quiet",
+            "--property", "KillMode=mixed",
+            f"--property=StandardOutput=append:{os.path.join(out, 'qemu.log')}",
+            f"--property=StandardError=append:{os.path.join(out, 'qemu.log')}",
+        ]
+        r = subprocess.run(wrapper + cmd, capture_output=True, text=True, check=False)
+        if r.returncode != 0:
+            sys.exit(f"systemd-run failed: {r.stderr.strip() or r.stdout.strip()}")
+        log(f"running as transient user service {unit}.service")
+    else:
+        with open(os.path.join(out, "qemu.log"), "ab") as qlog:
+            subprocess.Popen(cmd, stdout=qlog, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+
+    for _ in range(60):
+        if os.path.exists(os.path.join(out, "qmp.sock")):
+            break
+        time.sleep(0.5)
+    else:
+        sys.exit("QMP socket never appeared; see qemu.log")
+    log(f"started (acceleration: {'KVM' if kvm else 'TCG'})")
+
+
+def do_shot(args):
+    out = args.outdir
+    q = qmp(out)
+    ppm = os.path.join(out, f"screen-{args.tag}.ppm")
+    png = os.path.join(out, f"screen-{args.tag}.png")
+    try:
+        q.command("screendump", timeout=60, filename=ppm)
+    finally:
+        q.close()
+    if shutil.which("magick"):
+        scale = ["-resize", args.resize] if args.resize else []
+        subprocess.run(["magick", ppm, *scale, png], check=False)
+        if os.path.exists(png):
+            os.unlink(ppm)
+            print(png)
+            return
+    print(ppm)
+
+
+def do_click(args):
+    out = args.outdir
+    w, h = fb_size(out)
+    ax = int(args.x * ABS_MAX / w)
+    ay = int(args.y * ABS_MAX / h)
+    q = qmp(out)
+    try:
+        # Move first, as a separate event batch: a move+press in one batch is
+        # delivered too fast for some toolkits to register hover state.
+        q.command("input-send-event", events=[
+            {"type": "abs", "data": {"axis": "x", "value": ax}},
+            {"type": "abs", "data": {"axis": "y", "value": ay}},
+        ])
+        time.sleep(0.3)
+        for down in (True, False):
+            q.command("input-send-event", events=[
+                {"type": "btn", "data": {"down": down, "button": "left"}}])
+            time.sleep(0.12)
+    finally:
+        q.close()
+    if args.double:
+        time.sleep(0.05)
+        do_click(argparse.Namespace(**{**vars(args), "double": False}))
+
+
+def do_key(args):
+    q = qmp(args.outdir)
+    try:
+        for spec in args.keys:
+            keys = [{"type": "qcode", "data": k} for k in spec.split("+")]
+            q.command("send-key", keys=keys)
+            time.sleep(args.delay)
+    finally:
+        q.close()
+
+
+def do_type(args):
+    q = qmp(args.outdir)
+    try:
+        for ch in args.text:
+            names, shift = char_to_keys(ch)
+            keys = [{"type": "qcode", "data": "shift"}] if shift else []
+            keys += [{"type": "qcode", "data": n} for n in names]
+            q.command("send-key", keys=keys)
+            time.sleep(args.delay)
+    finally:
+        q.close()
+
+
+def do_sh(args):
+    a = qga(args.outdir, timeout=args.timeout)
+    if a is None:
+        sys.exit("guest agent did not respond")
+    try:
+        rc, o, e = qga_run(a, args.command, timeout=args.exec_timeout)
+    finally:
+        a.close()
+    if o:
+        sys.stdout.write(o)
+    if e:
+        sys.stderr.write(e)
+    sys.exit(rc)
+
+
+def do_wait_agent(args):
+    t0 = time.time()
+    a = qga(args.outdir, timeout=args.timeout)
+    if a is None:
+        sys.exit(f"guest agent did not respond within {args.timeout}s")
+    a.close()
+    log(f"guest agent responded after {time.time() - t0:.0f}s")
+
+
+def do_size(args):
+    w, h = fb_size(args.outdir)
+    print(f"{w}x{h}")
+
+
+def do_stop(args):
+    try:
+        q = qmp(args.outdir)
+    except OSError:
+        log("no running VM")
+        return
+    try:
+        try:
+            q.command("system_powerdown")
+        except (RuntimeError, TimeoutError):
+            pass
+        for _ in range(args.wait):
+            time.sleep(1)
+            try:
+                q.command("query-status", timeout=5)
+            except (RuntimeError, TimeoutError, EOFError, OSError):
+                log("guest powered down")
+                return
+        log("guest did not power down in time; quitting QEMU")
+        try:
+            q.command("quit", timeout=5)
+        except (RuntimeError, TimeoutError, EOFError, OSError):
+            pass
+    finally:
+        q.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-o", "--outdir", default=DEFAULT_OUT)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start"); s.set_defaults(fn=do_start)
+    s.add_argument("--iso")
+    s.add_argument("--disk", required=True)
+    s.add_argument("--disk-size", type=int, default=40, help="GiB, if created")
+    s.add_argument("--memory", default="6144")
+    s.add_argument("--cpus", default="4")
+    s.add_argument("--fresh-nvram", action="store_true")
+    s.add_argument("--detach", action="store_true",
+                   help="run QEMU as a transient systemd user service so it "
+                        "survives the invoking session ending")
+    s.add_argument("--unit", default="kedra-testvm",
+                   help="systemd unit name used by --detach")
+
+    s = sub.add_parser("shot"); s.set_defaults(fn=do_shot)
+    s.add_argument("tag")
+    s.add_argument("--resize", default="900x")
+
+    s = sub.add_parser("click"); s.set_defaults(fn=do_click)
+    s.add_argument("x", type=int); s.add_argument("y", type=int)
+    s.add_argument("--double", action="store_true")
+
+    s = sub.add_parser("key"); s.set_defaults(fn=do_key)
+    s.add_argument("keys", nargs="+")
+    s.add_argument("--delay", type=float, default=0.15)
+
+    s = sub.add_parser("type"); s.set_defaults(fn=do_type)
+    s.add_argument("text")
+    s.add_argument("--delay", type=float, default=0.06)
+
+    s = sub.add_parser("sh"); s.set_defaults(fn=do_sh)
+    s.add_argument("command")
+    s.add_argument("--timeout", type=int, default=120)
+    s.add_argument("--exec-timeout", type=int, default=1800)
+
+    s = sub.add_parser("wait-agent"); s.set_defaults(fn=do_wait_agent)
+    s.add_argument("--timeout", type=int, default=600)
+
+    s = sub.add_parser("size"); s.set_defaults(fn=do_size)
+
+    s = sub.add_parser("stop"); s.set_defaults(fn=do_stop)
+    s.add_argument("--wait", type=int, default=60)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

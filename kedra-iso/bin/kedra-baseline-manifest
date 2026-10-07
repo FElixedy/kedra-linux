@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+#
+# kedra-baseline-manifest -- emit a milestone baseline manifest.
+#
+#   kedra-baseline-manifest --iso ISO --outdir DIR [--milestone N]
+#                           [--note TEXT] [--result NAME=PASS ...]
+#
+# Writes m<N>-baseline.json (machine-readable) and m<N>-baseline.md
+# (human-readable) describing exactly one immutable baseline: which source
+# commits, which upstream baselines, which package artifacts, which repository
+# database and which ISO were tested together, and in what environment.
+#
+# --milestone selects which baseline is being written; it decides the tag name
+# and both filenames, and nothing else. One generator, one shape, one tag scheme
+# per milestone -- see baseline/README.md.
+#
+# EVERYTHING MECHANICAL IS MEASURED, NOT TYPED. Commits come from git, hashes
+# from sha256sum, package versions from the packages' own .PKGINFO, the archiso
+# version from pacman. The only inputs are the acceptance results, which are
+# observations a script cannot make on its own and are therefore passed in
+# explicitly with --result.
+#
+# NO SECRETS. The signing key's FINGERPRINT is recorded because verifying the
+# baseline requires knowing which key to expect; no secret key material, and no
+# exported private material of any kind, is read or written here.
+
+set -euo pipefail
+
+_src_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=bin/_kedra.sh
+source "${_src_dir}/_kedra.sh"
+
+PROJECTS=${KEDRA_PROJECTS:-$(dirname -- "${_KEDRA_ISO_ROOT}")}
+# Every repository that produces something the milestone ships. kedra-packages
+# joined the list when the Experience packages became part of the product; it
+# sits beside ${PROJECTS} rather than inside it, which repo_path() handles.
+REPOS=(kedra-hooks kedra-keyring kedra-repo kedra-calamares kedra-packages kedra-iso)
+
+iso=""; outdir=""; iso_commit=""; milestone="0"; note=""; declare -a results=()
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--iso)        iso=$2; shift 2 ;;
+		--outdir)     outdir=$2; shift 2 ;;
+		--iso-commit) iso_commit=$2; shift 2 ;;
+		--milestone)  milestone=$2; shift 2 ;;
+		--note)       note=$2; shift 2 ;;
+		--result)     results+=("$2"); shift 2 ;;
+		*) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+	esac
+done
+[[ ${milestone} =~ ^[0-9]+$ ]] || { printf -- '--milestone must be a number\n' >&2; exit 2; }
+tag="m${milestone}"
+note=${note:-"Milestone ${milestone} baseline. Records the exact sources, artifacts and environment that were built and accepted together. Contains no secret key material."}
+[[ -n ${iso} && -f ${iso} ]]  || { printf 'need --iso PATH (existing file)\n' >&2; exit 2; }
+[[ -n ${outdir} ]]            || { printf 'need --outdir DIR\n' >&2; exit 2; }
+mkdir -p "${outdir}"
+
+die() { printf 'kedra-baseline-manifest: %s\n' "$*" >&2; exit 1; }
+
+# --- helpers ---------------------------------------------------------------
+jstr() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+sha()  { sha256sum "$1" | cut -d' ' -f1; }
+
+# Where a repository lives. Kedra's checkouts are not all siblings: kedra-packages
+# is one level up from the rest, so the lookup tries both rather than encoding
+# one developer's layout.
+repo_path() {
+	local name=$1 parent
+	parent=$(dirname -- "${PROJECTS}")
+	if   [[ -d ${PROJECTS}/${name}/.git ]]; then printf '%s' "${PROJECTS}/${name}"
+	elif [[ -d ${parent}/${name}/.git   ]]; then printf '%s' "${parent}/${name}"
+	else return 1
+	fi
+}
+
+git_at() { git -C "$(repo_path "$1")" "${@:2}"; }
+
+# A dirty tree cannot be described by a commit hash, so refuse to pretend.
+#
+# The generator's OWN output is excluded. The manifest is written into the tree
+# it describes, so counting it as dirt would make the check refuse on its second
+# run forever. It is not part of what the manifest describes: the manifest
+# records the commit that was built and tested, and is then committed on top of
+# it. See baseline/README.md.
+outdir_abs=$(cd -- "${outdir}" && pwd -P)
+for r in "${REPOS[@]}"; do
+	repo_path "${r}" >/dev/null || die "${r} is not a git repository under ${PROJECTS} or beside it"
+	repo_abs=$(cd -- "$(repo_path "${r}")" && pwd -P)
+	dirty=$(git_at "${r}" status --porcelain)
+	if [[ ${outdir_abs} == "${repo_abs}"/* ]]; then
+		rel=${outdir_abs#"${repo_abs}"/}
+		dirty=$(printf '%s\n' "${dirty}" | grep -v " ${rel}/" || true)
+	fi
+	[[ -z $(printf '%s' "${dirty}" | tr -d '[:space:]') ]] ||
+		die "${r} has uncommitted changes; the baseline would not be reproducible:"$'\n'"${dirty}"
+done
+
+# --- source repositories ---------------------------------------------------
+declare -A HEAD BRANCH CDATE SUBJECT
+for r in "${REPOS[@]}"; do
+	HEAD[$r]=$(git_at "$r" rev-parse HEAD)
+	BRANCH[$r]=$(git_at "$r" rev-parse --abbrev-ref HEAD)
+	CDATE[$r]=$(git_at "$r" log -1 --format=%cI)
+	SUBJECT[$r]=$(git_at "$r" log -1 --format=%s)
+done
+
+# --- upstream baselines ----------------------------------------------------
+upstream_iso=$(git_at kedra-iso        rev-parse upstream-baseline 2>/dev/null || echo "")
+upstream_cal=$(git_at kedra-calamares  rev-parse upstream-baseline 2>/dev/null || echo "")
+upstream_iso_url=$(git_at kedra-iso       remote get-url upstream 2>/dev/null || echo "")
+upstream_cal_url=$(git_at kedra-calamares remote get-url upstream 2>/dev/null || echo "")
+
+# --- packages, as named by the repository database -------------------------
+# The docroot keeps superseded releases on purpose, so the database -- what
+# pacman actually resolves -- decides what is IN the baseline.
+db="${KEDRA_REPO_DIR}/${KEDRA_REPO_NAME}.db"
+[[ -f ${db} ]] || die "no repository database at ${db}"
+mapfile -t dbfiles < <(bsdtar -xOf "${db}" --include '*/desc' |
+	awk '/^%FILENAME%/{getline f; print f}' | sort)
+(( ${#dbfiles[@]} )) || die "repository database names no packages"
+
+# --- ISO -------------------------------------------------------------------
+iso_sha=$(sha "${iso}")
+iso_size=$(stat -c%s "${iso}")
+iso_mtime=$(date -Is -d "@$(stat -c%Y "${iso}")")
+archiso_ver=$(pacman -Q archiso 2>/dev/null | awk '{print $2}')
+qemu_ver=$(qemu-system-x86_64 --version | head -1 | awk '{print $4}')
+ovmf_ver=$(pacman -Q edk2-ovmf 2>/dev/null | awk '{print $2}')
+pacman_ver=$(pacman -Q pacman 2>/dev/null | awk '{print $2}')
+# The signing GNUPGHOME belongs to kedra-repo, not kedra-iso, so bin/_kedra.sh
+# does not define it. Mirror kedra-repo/bin/_common.sh's default here rather
+# than sourcing a script from another repository.
+KEDRA_SIGNING_GNUPGHOME=${KEDRA_SIGNING_GNUPGHOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/kedra-dev-signing/gnupg}
+# WHICH COMMIT THE IMAGE CAME FROM
+# --------------------------------
+# The tag points at kedra-iso HEAD, but the ISO was built earlier, from whatever
+# the tree held at build time. Claiming they are the same without checking is
+# precisely the assumption M0.1 exists to remove -- an artifact asserted to match
+# a commit it was not built from is the original defect.
+#
+# So the build commit is recorded separately, and every path that can affect the
+# image is diffed between it and HEAD. Commits touching only tooling that never
+# enters the image (this script, the test harness) leave the image reproducible
+# from the tag; a difference in the profile does not, and is a hard error.
+iso_commit=${iso_commit:-${HEAD[kedra-iso]}}
+git_at kedra-iso cat-file -e "${iso_commit}^{commit}" 2>/dev/null ||
+	die "--iso-commit ${iso_commit} is not a commit in kedra-iso"
+iso_commit=$(git_at kedra-iso rev-parse "${iso_commit}")
+IMAGE_PATHS=(archiso util-iso.sh util-iso-mount.sh util.sh buildiso.sh bin/_kedra.sh bin/kedra-iso-keyring-init)
+image_drift=$(git_at kedra-iso diff --name-only "${iso_commit}" HEAD -- "${IMAGE_PATHS[@]}")
+if [[ -n ${image_drift} ]]; then
+	printf 'kedra-baseline-manifest: image-affecting files changed since the ISO was built:\n' >&2
+	printf '  %s\n' ${image_drift} >&2
+	die "the ISO is not reproducible from kedra-iso HEAD; rebuild it or pass the right --iso-commit"
+fi
+if [[ ${iso_commit} == "${HEAD[kedra-iso]}" ]]; then
+	iso_provenance="built from kedra-iso HEAD"
+else
+	iso_provenance="built from kedra-iso ${iso_commit}; HEAD differs only in files that never enter the image ($(git_at kedra-iso rev-list --count "${iso_commit}".."${HEAD[kedra-iso]}") later commit(s))"
+fi
+
+signing_fpr=$(cat "$(dirname "${KEDRA_SIGNING_GNUPGHOME}")/packager-fingerprint" 2>/dev/null || echo "")
+[[ -n ${signing_fpr} ]] || die "no packager fingerprint found; the baseline could not be verified without it"
+
+generated=$(date -Is)
+
+# --- JSON ------------------------------------------------------------------
+{
+printf '{\n'
+printf '  "schema": "kedra.baseline/1",\n'
+printf '  "milestone": %s,\n' "$(jstr "${milestone}")"
+printf '  "tag": %s,\n' "$(jstr "${tag}")"
+printf '  "generated": %s,\n' "$(jstr "${generated}")"
+printf '  "note": %s,\n' "$(jstr "${note}")"
+
+printf '  "sources": {\n'
+for i in "${!REPOS[@]}"; do
+	r=${REPOS[$i]}
+	printf '    %s: { "commit": %s, "branch": %s, "date": %s, "subject": %s }%s\n' \
+		"$(jstr "$r")" "$(jstr "${HEAD[$r]}")" "$(jstr "${BRANCH[$r]}")" \
+		"$(jstr "${CDATE[$r]}")" "$(jstr "${SUBJECT[$r]}")" \
+		"$([[ $i -lt $(( ${#REPOS[@]} - 1 )) ]] && echo ,)"
+done
+printf '  },\n'
+
+printf '  "upstream_baselines": {\n'
+printf '    "cachyos-live-iso":  { "commit": %s, "url": %s },\n' "$(jstr "${upstream_iso}")" "$(jstr "${upstream_iso_url}")"
+printf '    "cachyos-calamares": { "commit": %s, "url": %s }\n'  "$(jstr "${upstream_cal}")" "$(jstr "${upstream_cal_url}")"
+printf '  },\n'
+
+printf '  "packages": [\n'
+for i in "${!dbfiles[@]}"; do
+	f=${dbfiles[$i]}; p="${KEDRA_REPO_DIR}/${f}"
+	[[ -f ${p} ]] || die "database names ${f}, which is not in the docroot"
+	n=$(bsdtar -xOqf "${p}" .PKGINFO | awk -F' = ' '$1=="pkgname"{print $2; exit}')
+	v=$(bsdtar -xOqf "${p}" .PKGINFO | awk -F' = ' '$1=="pkgver"{print $2; exit}')
+	printf '    { "name": %s, "version": %s, "filename": %s, "size": %s, "sha256": %s, "signature": %s, "signature_sha256": %s }%s\n' \
+		"$(jstr "$n")" "$(jstr "$v")" "$(jstr "$f")" "$(stat -c%s "$p")" \
+		"$(jstr "$(sha "$p")")" "$(jstr "${f}.sig")" "$(jstr "$(sha "${p}.sig")")" \
+		"$([[ $i -lt $(( ${#dbfiles[@]} - 1 )) ]] && echo ,)"
+done
+printf '  ],\n'
+
+printf '  "repository": {\n'
+printf '    "name": %s,\n' "$(jstr "${KEDRA_REPO_NAME}")"
+printf '    "arch": %s,\n' "$(jstr "${KEDRA_REPO_ARCH}")"
+printf '    "layout": "$repo/os/$arch",\n'
+printf '    "signing_key_fingerprint": %s,\n' "$(jstr "${signing_fpr}")"
+printf '    "signing_key_kind": "DEVELOPMENT -- not a production Kedra identity",\n'
+for f in "${KEDRA_REPO_NAME}.db.tar.zst" "${KEDRA_REPO_NAME}.db.tar.zst.sig" \
+         "${KEDRA_REPO_NAME}.files.tar.zst" "${KEDRA_REPO_NAME}.files.tar.zst.sig"; do
+	printf '    %s: %s,\n' "$(jstr "$f")" "$(jstr "$(sha "${KEDRA_REPO_DIR}/${f}")")"
+done
+printf '    "database_names": %s\n' "$(printf '%s\n' "${dbfiles[@]}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')"
+printf '  },\n'
+
+printf '  "iso": {\n'
+printf '    "filename": %s,\n' "$(jstr "$(basename "${iso}")")"
+printf '    "sha256": %s,\n'   "$(jstr "${iso_sha}")"
+printf '    "size_bytes": %s,\n' "${iso_size}"
+printf '    "built": %s,\n'    "$(jstr "${iso_mtime}")"
+printf '    "archiso_version": %s,\n' "$(jstr "${archiso_ver}")"
+printf '    "built_from_commit": %s,\n' "$(jstr "${iso_commit}")"
+printf '    "provenance": %s\n' "$(jstr "${iso_provenance}")"
+printf '  },\n'
+
+printf '  "acceptance_environment": {\n'
+printf '    "hypervisor": %s,\n'  "$(jstr "QEMU ${qemu_ver} with KVM")"
+printf '    "firmware": %s,\n'    "$(jstr "OVMF (edk2-ovmf ${ovmf_ver}), UEFI")"
+printf '    "vm_arch": "x86_64 (q35, -cpu host)",\n'
+printf '    "disk": "single blank raw virtio-blk image",\n'
+printf '    "filesystem": "Btrfs",\n'
+printf '    "desktop": "GNOME (GDM)",\n'
+printf '    "bootloader": "GRUB (the canonical Kedra bootloader)",\n'
+printf '    "pacman_version": %s\n' "$(jstr "${pacman_ver}")"
+printf '  },\n'
+
+printf '  "acceptance_results": {\n'
+for i in "${!results[@]}"; do
+	k=${results[$i]%=*}; v=${results[$i]##*=}
+	printf '    %s: %s%s\n' "$(jstr "$k")" "$(jstr "$v")" \
+		"$([[ $i -lt $(( ${#results[@]} - 1 )) ]] && echo ,)"
+done
+printf '  }\n'
+printf '}\n'
+} > "${outdir}/${tag}-baseline.json"
+
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${outdir}/${tag}-baseline.json" ||
+	die "generated JSON is not valid"
+
+# --- Markdown --------------------------------------------------------------
+{
+printf '# Kedra Linux -- Milestone %s baseline\n\n' "${milestone}"
+printf 'Tag: `%s`  ·  Generated: %s\n\n' "${tag}" "${generated}"
+printf '%s\n\n' "${note}"
+printf 'Machine-readable form: `%s-baseline.json`.\n\n' "${tag}"
+printf 'Contains no private key material.\n\n'
+
+printf '## Source repositories\n\n'
+printf '| Repository | Commit | Branch | Date | Head subject |\n|---|---|---|---|---|\n'
+for r in "${REPOS[@]}"; do
+	printf '| `%s` | `%s` | `%s` | %s | %s |\n' "$r" "${HEAD[$r]}" "${BRANCH[$r]}" "${CDATE[$r]}" "${SUBJECT[$r]}"
+done
+
+printf '\n## Upstream baselines\n\n'
+printf '| Upstream | Commit | Source |\n|---|---|---|\n'
+printf '| CachyOS Live ISO | `%s` | %s |\n'   "${upstream_iso}" "${upstream_iso_url}"
+printf '| cachyos-calamares | `%s` | %s |\n'  "${upstream_cal}" "${upstream_cal_url}"
+
+printf '\n## Packages in the baseline\n\n'
+printf 'As named by `%s.db` -- superseded releases remain in the docroot but are not part of the baseline.\n\n' "${KEDRA_REPO_NAME}"
+printf '| Package | Version | File | Size | SHA-256 |\n|---|---|---|---|---|\n'
+for f in "${dbfiles[@]}"; do
+	p="${KEDRA_REPO_DIR}/${f}"
+	n=$(bsdtar -xOqf "$p" .PKGINFO | awk -F' = ' '$1=="pkgname"{print $2; exit}')
+	v=$(bsdtar -xOqf "$p" .PKGINFO | awk -F' = ' '$1=="pkgver"{print $2; exit}')
+	printf '| `%s` | `%s` | `%s` | %s | `%s` |\n' "$n" "$v" "$f" "$(stat -c%s "$p")" "$(sha "$p")"
+done
+printf '\nEvery package above has a detached `.sig` alongside it:\n\n'
+printf '| Signature | SHA-256 |\n|---|---|\n'
+for f in "${dbfiles[@]}"; do
+	printf '| `%s.sig` | `%s` |\n' "$f" "$(sha "${KEDRA_REPO_DIR}/${f}.sig")"
+done
+
+printf '\n## Repository\n\n'
+printf '| Object | SHA-256 |\n|---|---|\n'
+for f in "${KEDRA_REPO_NAME}.db.tar.zst" "${KEDRA_REPO_NAME}.db.tar.zst.sig" \
+         "${KEDRA_REPO_NAME}.files.tar.zst" "${KEDRA_REPO_NAME}.files.tar.zst.sig"; do
+	printf '| `%s` | `%s` |\n' "$f" "$(sha "${KEDRA_REPO_DIR}/${f}")"
+done
+printf '\nSigning key fingerprint: `%s`\n' "${signing_fpr}"
+printf '\n**DEVELOPMENT key.** Not a production Kedra identity; replacing it is Alpha work.\n'
+
+printf '\n## ISO\n\n'
+printf '| Field | Value |\n|---|---|\n'
+printf '| Filename | `%s` |\n'   "$(basename "${iso}")"
+printf '| SHA-256 | `%s` |\n'    "${iso_sha}"
+printf '| Size | %s bytes (%s) |\n' "${iso_size}" "$(numfmt --to=iec "${iso_size}")"
+printf '| Built | %s |\n'        "${iso_mtime}"
+printf '| archiso | `%s` |\n'    "${archiso_ver}"
+printf '| Built from | `%s` |\n'  "${iso_commit}"
+printf '| Provenance | %s |\n'    "${iso_provenance}"
+
+printf '\n## Acceptance environment\n\n'
+printf '| Field | Value |\n|---|---|\n'
+printf '| Hypervisor | QEMU %s with KVM |\n' "${qemu_ver}"
+printf '| Firmware | OVMF / UEFI (edk2-ovmf %s) |\n' "${ovmf_ver}"
+printf '| VM architecture | x86_64, q35, `-cpu host` |\n'
+printf '| Disk | single blank raw virtio-blk image |\n'
+printf '| Filesystem | Btrfs |\n'
+printf '| Desktop | GNOME (GDM) |\n'
+printf '| Bootloader | GRUB |\n'
+printf '| pacman | `%s` |\n' "${pacman_ver}"
+
+if (( ${#results[@]} )); then
+printf '\n## Acceptance results\n\n'
+printf '| Criterion | Result |\n|---|---|\n'
+for kv in "${results[@]}"; do printf '| %s | **%s** |\n' "${kv%=*}" "${kv##*=}"; done
+fi
+} > "${outdir}/${tag}-baseline.md"
+
+printf 'wrote %s\n' "${outdir}/${tag}-baseline.json"
+printf 'wrote %s\n' "${outdir}/${tag}-baseline.md"

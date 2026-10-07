@@ -1,0 +1,258 @@
+# Maintainer: Kedra Linux <packages@kedralinux.org>
+
+pkgname=kedra-experience-runtime
+# 0.2.0: the resolver enforces `user_selectable` on caller-supplied module
+# overrides. `resolve` gained diagnostics.refused_overrides and a second
+# reason to exit 2, so resolve_schema_version went to 2 with it.
+# 0.4.0: the production apply path. `apply` and `unmanage` enact the MANAGED
+# part of a profile inside the user's own GNOME session, which is the first time
+# this package writes a desktop value -- and the first time it needs a desktop
+# to be present. See docs/kedra-experience-runtime.md.
+pkgver=0.4.0
+# pkgrel 2: the shipped manual and this package's own description still called
+# the runtime read-only and said the executor, ownership, locking, conflict and
+# GSettings modules were not on a target. 0.4.0 ships all of them, on purpose.
+# Documentation only -- no code, no unit and no dependency changed, so pkgver
+# stays where it is.
+pkgrel=2
+pkgdesc="Kedra Experience profile resolver, and the command that resolves, records and applies a profile"
+arch=('any')
+url="https://github.com/KedraLinux/kedra-packages"
+license=('GPL-3.0-or-later')
+
+# WHAT THIS PACKAGE IS FOR
+#
+# Until it existed, the Experience resolver lived only in this repository's
+# tooling: no package installed it, and `manifests.default_data_dir()` resolved
+# relative to a source checkout. Nothing on an installed Kedra system could
+# answer "which profile is this, and what does it need?" -- which is the one
+# question an installer has to ask.
+#
+# This package puts that answer on the target, and since 0.4.0 it also acts on
+# it: `apply` enacts the managed part of a profile in the user's own session.
+#
+# It is no longer read-only, and has not been since 0.4.0: `install-state` writes
+# one user's chosen profile into a target root, and `apply` writes the MANAGED
+# settings of that profile inside the user's own session. The executor, the
+# ownership model, the locking and the GSettings adapter are therefore all on the
+# target -- they have to be, because that session is the only correct place for
+# this work to happen.
+#
+# What it will NOT do is write a `policy = "default"` setting into anybody's
+# dconf. The five-workspace model and the Super+1..5 keymap are delivered as
+# package-owned GSettings vendor overrides by kedra-experience-desktop and
+# kedra-experience-workflow, and `apply` touching them would create an ownership
+# claim over values Kedra never wrote -- so a later revert would "restore"
+# something it never changed. That is enforced twice inside the library, in the
+# planner and again in the executor, and asserted by the test suite.
+
+# The library goes to a PRIVATE path, not site-packages.
+#
+# It is Kedra-internal. `import kedra_experience` from an unrelated program must
+# keep failing, because this is not a stable third-party API and nothing outside
+# Kedra should be able to depend on it. /usr/lib/kedra/ mirrors how the manifest
+# tree is scoped under /usr/share/kedra/.
+_libdir=/usr/lib/kedra/experience
+
+# Modules installed, read from kedra_experience.RUNTIME_MODULES at build time
+# rather than listed here.
+#
+# That list is exactly the transitive import closure of `prodcli`, the shipped
+# CLI -- verified from the AST by tests/test_runtime_package.py, which also
+# asserts that the modules in UNSHIPPED_MODULES (`cli`, `vendordefaults`,
+# `observed`) stay off a target: developer tooling, build-time rendering, and a
+# way to feed the executor made-up desktop values.
+#
+# The boundary that guarantee protects moved in 0.4.0 rather than disappearing.
+# It is no longer "no executor is present" -- one is, and must be -- it is that
+# `apply` writes only `policy = "managed"` resources, enforced independently by
+# the planner and the executor and asserted by the suite below.
+#
+# Reading the list instead of duplicating it means the package and the tests
+# cannot disagree about what is shipped.
+
+# Runtime dependencies, read off the actual imports of the shipped modules
+# rather than copied from what the test suite happens to need.
+#
+#   python          the package is Python; `tomllib`, the only TOML reader used,
+#                   is stdlib from 3.11.
+#
+#   kedra-experience
+#                   owns /usr/share/kedra/experience, the only tree this package
+#                   reads. Without it every command fails.
+#
+#   python-gobject  `gsettings` uses Gio.Settings through PyGObject to read and
+#                   write the user's desktop configuration. Direct, not through
+#                   the `gsettings(1)` command line, because types survive and
+#                   "is a value explicitly stored?" is answerable -- the question
+#                   the whole ownership model turns on.
+#
+#   glib2           supplies the GObject-Introspection typelibs PyGObject loads
+#                   at runtime for Gio and GLib. python-gobject depends on it,
+#                   but this package's correctness depends on it directly, so it
+#                   is declared rather than inherited.
+#
+#   gtk4            NOT optional, and this is the one worth stating plainly.
+#                   `accelerators` asks GTK whether two accelerator strings mean
+#                   the same combination -- gtk_accelerator_parse is the function
+#                   GNOME itself parses them with, and there is deliberately no
+#                   fallback parser, because a second grammar's disagreements
+#                   would surface as "no conflict", the one answer that must
+#                   never be produced by accident. Without GTK the conflict
+#                   checker reports itself unavailable and every shortcut is
+#                   BLOCKED rather than registered. Super+Enter would then never
+#                   appear, silently, on every login. A dependency that decides
+#                   whether a feature works at all is a hard dependency.
+#
+# Still deliberately absent: nothing in the shipped set imports gi at module
+# scope, so `profiles`, `resolve` and `install-state` keep working on a machine
+# with no desktop at all. tests/test_runtime_package.py fails the build if a
+# top-level `import gi` ever appears.
+depends=('python' 'kedra-experience' 'python-gobject' 'glib2' 'gtk4')
+
+# gnome-settings-daemon owns the media-keys schemas the terminal shortcut writes
+# into. Not a hard dependency: the runtime is correct on a system that does not
+# have them (the adapter reports the schema missing and the planner refuses),
+# and a Kedra profile pulls GNOME in through its own module requirements anyway.
+optdepends=(
+  'gnome-settings-daemon: the media-keys schemas the Kedra terminal shortcut is written into'
+  'gnome-console: the terminal the Kedra Super+Enter shortcut launches'
+)
+
+# python runs the test suite and reads RUNTIME_MODULES during check()/package().
+makedepends=('python')
+checkdepends=('python')
+
+# Monorepo payload: the library lives in ../tools, so there is nothing to fetch
+# or verify.
+source=()
+sha256sums=()
+
+_toolsdir() {
+  echo "$startdir/../tools"
+}
+
+_runtime_modules() {
+  # The single source of truth for what is shipped. Printed one per line.
+  PYTHONPATH="$(_toolsdir)" python3 -c \
+    'from kedra_experience import RUNTIME_MODULES; print("\n".join(RUNTIME_MODULES))'
+}
+
+check() {
+  local tools; tools="$(_toolsdir)"
+  local data="$startdir/../kedra-experience/data/experience"
+
+  # 1. The manifests the CLI will be asked to resolve must be valid. A runtime
+  #    that ships against a broken tree is not worth building.
+  python3 "$tools/validate-experience.py" "$data"
+
+  # 2. The whole suite, which includes the closure/boundary tests that decide
+  #    what package() installs and the CLI contract tests. Offline: no session,
+  #    no dconf, no live GSettings, and no read of /usr/share/kedra.
+  python3 -m unittest discover -s "$startdir/../tests"
+
+  # 3. The shipped CLI actually answers, against the in-tree manifests. This is
+  #    a smoke test of the real entry point, not of an importable function --
+  #    the installed-layout test in the suite proves the packaged form works
+  #    with no checkout present at all.
+  local out
+  out=$("$tools/kedra-experience" --data-dir "$data" profiles --format json)
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["profiles_schema_version"] == 1' \
+    <<<"$out"
+
+  out=$(echo '{"base_preset":"vanilla"}' |
+    "$tools/kedra-experience" --data-dir "$data" resolve --selection -)
+  python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["applies_experience_layer"] is False, "vanilla must not apply the layer"
+assert d["packages"]["required"] == [], "vanilla must require no package"
+' <<<"$out"
+
+  # 4. A selection may not switch off a module that is not the user's to switch.
+  #    Checked through the real command rather than only in the suite, because
+  #    this is the guarantee that keeps the Experience layer's own delivery in
+  #    the package set no matter what an installer sends. Exit 2 is expected.
+  out=$(echo '{"base_preset":"kedra","module_overrides":[{"id":"integration","enabled":false}]}' |
+    "$tools/kedra-experience" --data-dir "$data" resolve --selection -) && {
+    echo "==> ERROR: a refused override must not exit 0" >&2
+    return 1
+  }
+  python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["diagnostics"]["ok"] is False, "a refused override must invalidate the profile"
+refused = d["diagnostics"]["refused_overrides"]
+assert [r["module"] for r in refused] == ["integration"], refused
+assert refused[0]["code"] == "module-not-user-selectable", refused
+for name in ("kedra-experience", "kedra-experience-runtime"):
+    assert name in d["packages"]["required"], f"{name} was dropped by a refused override"
+' <<<"$out"
+
+  # 5. The activation unit must invoke the safe production verb and nothing
+  #    else. A unit that grew an --operation switch, or called a verb that can
+  #    reclaim a resource over a user's divergence, would be a login that
+  #    overwrites people's settings.
+  local unit="$startdir/systemd/kedra-experience-activate.service"
+  grep -q '^ExecStart=/usr/bin/kedra-experience apply' "$unit" ||
+    { echo "==> ERROR: the activation unit does not ExecStart kedra-experience apply" >&2; return 1; }
+  if grep -qE '^ExecStart=.*(--operation|unmanage|restore|--force)' "$unit"; then
+    echo "==> ERROR: the activation unit invokes more than 'apply'" >&2
+    return 1
+  fi
+  grep -q '^ConditionPathExists=' "$unit" ||
+    { echo "==> ERROR: the activation unit has no no-state condition" >&2; return 1; }
+  grep -q '^SuccessExitStatus=3' "$unit" ||
+    { echo "==> ERROR: a blocked shortcut must not fail the unit" >&2; return 1; }
+  echo "kedra-experience-runtime: activation unit invokes only 'apply'"
+
+  echo "kedra-experience-runtime: CLI answers from the manifest tree"
+}
+
+package() {
+  local tools; tools="$(_toolsdir)"
+
+  install -d "$pkgdir$_libdir/kedra_experience"
+
+  local module
+  while IFS= read -r module; do
+    [[ -n ${module} ]] || continue
+    install -Dm644 "$tools/kedra_experience/${module}.py" \
+      "$pkgdir$_libdir/kedra_experience/${module}.py"
+  done < <(_runtime_modules)
+
+  # No __pycache__ is shipped. Byte-compiling here would embed $pkgdir paths in
+  # the .pyc headers; Python regenerates them on the target if it can write, and
+  # runs fine from source if it cannot.
+
+  # The entry point is installed verbatim -- not generated, not sed-substituted.
+  # It hardcodes _libdir, which is what makes the installed command's behaviour
+  # independent of how or where the package was built.
+  install -Dm755 "$startdir/bin/kedra-experience" "$pkgdir/usr/bin/kedra-experience"
+
+  # The first-login carrier: a user-scoped systemd unit.
+  #
+  # User-scoped because the work is only possible inside the user's own
+  # graphical session -- session bus, dconf-service, GTK. A root service writing
+  # somebody's dconf, a chroot-time apply and a shell-profile hook are all
+  # wrong for the same reason, and none of them is used.
+  install -Dm644 "$startdir/systemd/kedra-experience-activate.service" \
+    "$pkgdir/usr/lib/systemd/user/kedra-experience-activate.service"
+
+  # Enabled by shipping the wants symlink rather than by an install scriptlet.
+  #
+  # A scriptlet cannot enable a *user* unit for users who do not exist yet, and
+  # `systemctl --global enable` writes into /etc, which would leave a dangling
+  # symlink behind on removal. The package-owned .wants directory is the
+  # ordinary mechanism -- pipewire and gnome-session use it -- and it disappears
+  # cleanly with the package.
+  #
+  # Enabling it for everyone is safe precisely because of the unit's
+  # ConditionPathExists: a user with no Kedra state file never runs it at all.
+  install -d "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../kedra-experience-activate.service \
+    "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/kedra-experience-activate.service"
+
+  install -Dm644 "$startdir/../docs/kedra-experience-runtime.md" \
+    -t "$pkgdir/usr/share/doc/$pkgname"
+}

@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+#
+# kedra-calamares-buildroot -- build the Kedra installer in a throwaway,
+# unprivileged build root. No sudo, no changes to the development host.
+#
+#   packaging/kedra-calamares-buildroot [--publish] [--keep]
+#
+# WHY THIS EXISTS
+# ---------------
+# `makepkg --syncdeps` installs build dependencies into the HOST, which needs
+# root and permanently changes the machine the ISO happens to be built on. This
+# workstream has consistently refused that trade (kedra-iso removed upstream's
+# `sudo sed -i /usr/bin/mkarchiso` for the same reason), and archiso >= 88 already
+# builds the ISO itself rootlessly via user namespaces.
+#
+# So the package is built the same way: a complete pacman root under
+# $KEDRA_BUILDROOT, populated and entered inside `unshare -r --map-auto`, with
+# the source tree bind-mounted in. Nothing outside $KEDRA_BUILDROOT and
+# $KEDRA_STAGING_DIR is written.
+#
+# WHAT THIS GIVES BEYOND "not needing root"
+# -----------------------------------------
+#   * The build sees ONLY its declared dependencies. A missing entry in the
+#     PKGBUILD's depends/makedepends fails here instead of working by accident on
+#     one developer's machine.
+#   * The build root is populated from the BASELINE Arch/CachyOS repositories, not
+#     this host's cachyos-*-znver4 ones, so nothing links against a
+#     CPU-optimised library by accident.
+#   * Signature verification is fully enabled, against the same build keyring
+#     kedra-iso uses. SigLevel = Never is not used here either.
+#
+# The host's own pacman database, keyring and /etc/makepkg.conf are never touched;
+# the host package cache is only ever READ, as a download shortcut.
+
+set -euo pipefail
+
+readonly HERE=$(dirname "$(readlink -f "$0")")
+readonly REPO_ROOT=$(readlink -f "${HERE}/..")
+
+KEDRA_BUILDROOT=${KEDRA_BUILDROOT:-${HOME}/Build/kedra-buildroot}
+KEDRA_BUILDCACHE=${KEDRA_BUILDCACHE:-${HOME}/Build/kedra-buildroot-cache}
+KEDRA_STAGING_DIR=${KEDRA_STAGING_DIR:-${HOME}/Build/kedra-staging}
+# Same build-local keyring kedra-iso creates with bin/kedra-iso-keyring-init:
+# archlinux + cachyos + kedra trust, outside the host keyring.
+KEDRA_BUILD_GPGDIR=${KEDRA_BUILD_GPGDIR:-${REPO_ROOT}/../kedra-iso/keyring}
+KEDRA_REPO_TOOLS=${KEDRA_REPO_TOOLS:-${REPO_ROOT}/../kedra-repo/bin}
+# Read-only download shortcuts. Never written to.
+KEDRA_HOST_CACHES=${KEDRA_HOST_CACHES:-/var/cache/pacman/pkg:${HOME}/Build/kedra-iso-cache}
+
+publish=0
+keep=0
+for a in "$@"; do
+	case ${a} in
+		--publish) publish=1 ;;
+		--keep)    keep=1 ;;
+		*) printf 'unknown option: %s\n' "${a}" >&2; exit 2 ;;
+	esac
+done
+
+msg()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+msg2() { printf '\033[1;32m  ->\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m==> ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# unshare -r --map-auto: our uid becomes 0, and the /etc/subuid range becomes
+# namespace uids 1..65535 -- which is what lets us create and run as an
+# unprivileged builder user inside the root (makepkg refuses to run as uid 0).
+ns()  { unshare -r --map-auto "$@"; }
+nsrm() { ns rm -rf -- "$@" 2>/dev/null || true; }
+
+unshare -r --map-auto -- true >/dev/null 2>&1 ||
+	die "unprivileged user namespaces are unavailable; this host cannot build rootlessly"
+grep -q "^${USER}:" /etc/subuid 2>/dev/null ||
+	die "no /etc/subuid range for ${USER}; --map-auto cannot map a builder uid"
+
+[[ -d ${KEDRA_BUILD_GPGDIR} ]] ||
+	die "build keyring ${KEDRA_BUILD_GPGDIR} is missing -- run: fakeroot kedra-iso/bin/kedra-iso-keyring-init"
+gpg --homedir "${KEDRA_BUILD_GPGDIR}" --no-permission-warning --list-keys --with-colons 2>/dev/null |
+	grep -q '^uid:[fu]:' ||
+	die "build keyring ${KEDRA_BUILD_GPGDIR} has no fully trusted keys"
+
+# The PKGBUILD packages a git clone of this tree, so uncommitted work is silently
+# absent from the package. Say so rather than shipping a surprise.
+if [[ -n $(git -C "${REPO_ROOT}" status --porcelain) ]]; then
+	msg "WARNING: working tree is dirty -- uncommitted changes will NOT be in the package:"
+	git -C "${REPO_ROOT}" status --short >&2
+fi
+
+readonly BUILD_COMMIT=$(git -C "${REPO_ROOT}" rev-parse --short kedra)
+msg "building kedra-calamares from ${BUILD_COMMIT} (branch kedra)"
+
+# --------------------------------------------------------------------------
+# Build-root package set: the PKGBUILD's depends + makedepends, plus the
+# toolchain. Deliberately explicit rather than parsed out of the PKGBUILD, so
+# that adding a dependency there is a conscious act here too.
+# --------------------------------------------------------------------------
+readonly -a BUILDROOT_PACKAGES=(
+	base base-devel git
+	# makedepends
+	boost cmake doxygen extra-cmake-modules ninja
+	python-jsonschema python-pyaml python-unidecode qt6-tools
+	# depends (present at build time so cmake finds them)
+	boost-libs ckbcomp cryptsetup dmidecode gptfdisk hwinfo
+	kconfig kcoreaddons kcrash ki18n kparts kpmcore kservice kwidgetsaddons
+	libpwquality mkinitcpio-openswap networkmanager polkit-qt6 python
+	qt6-declarative qt6-svg rsync solid squashfs-tools upower yaml-cpp
+	qt6-imageformats python-toml
+)
+
+readonly CONF=${KEDRA_BUILDCACHE}/pacman.buildroot.conf
+
+prepare_conf() {
+	install -d -m 0755 "${KEDRA_BUILDCACHE}"
+	# BASELINE repositories only. The host is a znver4 CachyOS machine whose
+	# own pacman.conf pulls cachyos-*-znver4 first; building against those would
+	# quietly link the installer to CPU-optimised libraries.
+	#
+	# Server = lines, not Include =: pacman-conf resolves Include against the
+	# filesystem it runs on, and a dangling include silently drops a repository
+	# (kedra-repo/docs/bootstrap.md, trap 2).
+	{
+		cat <<-EOF
+		[options]
+		Architecture = x86_64
+		HoldPkg = pacman glibc
+		ParallelDownloads = 10
+		# Signature verification stays fully enabled in the build root.
+		SigLevel = Required DatabaseOptional
+		LocalFileSigLevel = Optional
+		EOF
+		# $repo and $arch are left as pacman variables; pacman expands them per
+		# section. The two mirrorlists use different orderings of them
+		# ($repo/os/$arch for Arch, $arch/$repo for CachyOS), which is exactly why
+		# each list is reused verbatim rather than reconstructed.
+		printf '\n[cachyos]\n'
+		grep -E '^Server *= *' /etc/pacman.d/cachyos-mirrorlist | head -n3
+		for r in core extra multilib; do
+			printf '\n[%s]\n' "${r}"
+			grep -E '^Server *= *' /etc/pacman.d/mirrorlist | head -n3
+		done
+	} >"${CONF}"
+	grep -q '^Server = ' "${CONF}" || die "could not build a mirror list for the build root"
+}
+
+populate_buildroot() {
+	# ALWAYS from empty. A build root left behind by an earlier run -- and any
+	# run that fails after populate_buildroot leaves one -- is not a shortcut,
+	# it is a different build root.
+	#
+	# `pacman -S` installs MISSING dependencies but never upgrades ones already
+	# present, and BUILDROOT_PACKAGES names only direct dependencies. A surviving
+	# root therefore keeps its old transitive deps while the freshly synced
+	# databases describe new ones: the Aug-15 root carried qt6-base 6.11.1-1
+	# against a database offering 6.11.2-2, so qt6-declarative 6.11.2 was
+	# installed on top of a qt6-base it does not work with and cmake failed to
+	# find Qt6Quick at all. That is a partial upgrade, and had it linked instead
+	# of failing it would have produced a package whose contents no commit
+	# describes -- the same class of defect M0.1 exists to remove.
+	if [[ -d ${KEDRA_BUILDROOT} ]]; then
+		msg2 "removing the build root left by a previous run"
+		nsrm "${KEDRA_BUILDROOT}"
+	fi
+
+	local -a cachedirs=(--cachedir "${KEDRA_BUILDCACHE}/pkg")
+	local c
+	while IFS= read -r -d: c || [[ -n ${c} ]]; do
+		[[ -d ${c} && -r ${c} ]] && cachedirs+=(--cachedir "${c}")
+	done <<<"${KEDRA_HOST_CACHES}:"
+
+	install -d -m 0755 "${KEDRA_BUILDCACHE}/pkg"
+	ns install -d -m 0755 \
+		"${KEDRA_BUILDROOT}"/var/lib/pacman \
+		"${KEDRA_BUILDROOT}"/var/cache/pacman/pkg \
+		"${KEDRA_BUILDROOT}"/etc/pacman.d \
+		"${KEDRA_BUILDROOT}"/{dev,proc,sys,run,tmp,build}
+
+	msg2 "installing ${#BUILDROOT_PACKAGES[@]} package sets into the build root"
+	# Scriptlets run chrooted, and several need /proc; mount the API filesystems
+	# for the same reason Calamares' mount module does.
+	unshare -r --map-auto -m --propagation private /bin/sh -c '
+		root=$1; shift
+		mount --rbind /dev  "$root/dev"  2>/dev/null
+		mount --rbind /proc "$root/proc" 2>/dev/null
+		mount --rbind /sys  "$root/sys"  2>/dev/null
+		exec "$@"' _ "${KEDRA_BUILDROOT}" \
+		pacman --root "${KEDRA_BUILDROOT}" \
+			--dbpath "${KEDRA_BUILDROOT}/var/lib/pacman" \
+			--config "${CONF}" \
+			--gpgdir "${KEDRA_BUILD_GPGDIR}" \
+			--logfile "${KEDRA_BUILDCACHE}/pacman.log" \
+			"${cachedirs[@]}" \
+			-Sy --noconfirm --needed "${BUILDROOT_PACKAGES[@]}" ||
+		die "failed to populate the build root (see ${KEDRA_BUILDCACHE}/pacman.log)"
+}
+
+build_in_root() {
+	# makepkg refuses to run as uid 0, so build as a mapped unprivileged uid.
+	# /src is the source tree, read-only: the PKGBUILD clones it, it must not be
+	# able to write to it. /out receives the finished package.
+	install -d -m 0755 "${KEDRA_STAGING_DIR}"
+	ns install -d -m 0755 "${KEDRA_BUILDROOT}/out" "${KEDRA_BUILDROOT}/build"
+
+	unshare -r --map-auto -m --propagation private /bin/bash -c '
+		set -euo pipefail
+		root=$1; src=$2; staging=$3
+		mount --rbind /dev  "$root/dev"
+		mount --rbind /proc "$root/proc"
+		mount --rbind /sys  "$root/sys"
+		mkdir -p "$root/src"
+		mount --rbind "$src" "$root/src"
+		mount -o remount,ro,bind "$root/src"
+
+		# A real unprivileged user, so makepkg behaves exactly as it would for a
+		# developer. uid 1000 exists inside the namespace via the subuid map.
+		chroot "$root" /usr/bin/sh -c "
+			id -u builder >/dev/null 2>&1 ||
+				useradd -u 1000 -m -s /bin/bash builder
+			chown builder:builder /build
+		"
+
+		# HOME/BUILDDIR/PKGDEST all under /build, which belongs to the builder.
+		#
+		# PKGDEST is deliberately NOT the bind-mounted /out: that directory is the
+		# host staging dir, owned on the host by the invoking user, which inside
+		# this namespace means it is owned by root. Making it writable by the
+		# builder uid would mean either chmod 0777 on a host directory or
+		# chown-ing it to a subuid the host user cannot read. Building into the
+		# root and copying out as namespace-root afterwards avoids both.
+		#
+		# makepkg insists the PKGBUILD be in the current working directory, so it
+		# is run from /src/packaging. That directory is read-only, which is fine:
+		# BUILDDIR, PKGDEST and SRCDEST are all redirected into /build, and
+		# logging (the only other thing that writes to $startdir) is off.
+		chroot "$root" /usr/bin/setpriv --reuid=1000 --regid=1000 --clear-groups \
+			/usr/bin/env -i \
+			HOME=/build PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+			LANG=C.UTF-8 TERM=dumb \
+			MAKEPKG_CONF=/src/packaging/makepkg.kedra.conf \
+			BUILDDIR=/build/work \
+			PKGDEST=/build/out \
+			SRCDEST=/build/src \
+			/bin/bash -c "cd /src/packaging && exec makepkg --force --nodeps --noconfirm --cleanbuild"
+
+		# Still inside the namespace, and OUTSIDE the chroot -- so the staging
+		# directory is addressed by its real host path, and the copy runs as the
+		# uid that owns it.
+		cp -f "$root"/build/out/*.pkg.tar.zst* "$staging"/
+		chmod 0644 "$staging"/*.pkg.tar.zst*
+	' _ "${KEDRA_BUILDROOT}" "${REPO_ROOT}" "${KEDRA_STAGING_DIR}" ||
+		die "makepkg failed inside the build root"
+}
+
+# --------------------------------------------------------------------------
+
+prepare_conf
+populate_buildroot
+build_in_root
+
+pkg=$(find "${KEDRA_STAGING_DIR}" -maxdepth 1 -name 'kedra-calamares-*.pkg.tar.zst' \
+	! -name '*-debug-*' -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)
+[[ -n ${pkg} ]] || die "no kedra-calamares package appeared in ${KEDRA_STAGING_DIR}"
+msg "built ${pkg}"
+
+# --------------------------------------------------------------------------
+# Verify the ARTIFACT, not the configuration.
+#
+# The whole reason for makepkg.kedra.conf is that a -march=native build on this
+# znver4 host would SIGILL on older CPUs -- a failure that only appears on
+# hardware the builder does not own. Trusting that the config was honoured is
+# exactly the assumption that would hide it, so the built binary is disassembled
+# and checked for instructions the x86-64 baseline does not have.
+# --------------------------------------------------------------------------
+verify_baseline() {
+	command -v objdump >/dev/null || { msg2 "objdump unavailable; skipping ISA check"; return 0; }
+	local tmp; tmp=$(mktemp -d)
+	trap 'rm -rf "${tmp}"' RETURN
+
+	bsdtar -xf "${pkg}" -C "${tmp}" 2>/dev/null ||
+		die "could not extract the package for inspection"
+
+	# EVERY ELF object, not just usr/bin/calamares -- almost all of the code is in
+	# libcalamares*.so and the module plugins, so checking only the launcher would
+	# check the least interesting 2% of the package.
+	#
+	# AVX/AVX2/AVX-512 and BMI mnemonics, plus any ymm/zmm register reference: none
+	# of these exist in the x86-64 baseline, and -march=native on this host emits
+	# them freely.
+	local scanned=0 offenders=0 f hits
+	while IFS= read -r f; do
+		[[ $(file -b "${f}") == *ELF* ]] || continue
+		scanned=$((scanned + 1))
+		# `|| true` is load-bearing: grep exits 1 when it finds nothing, which is
+		# the GOOD case here, and under `set -o pipefail` that would abort the
+		# whole script -- silently, right before publishing.
+		hits=$(objdump -d --no-show-raw-insn "${f}" 2>/dev/null |
+			grep -oE '\b(vpternlog[a-z]*|kmov[a-z]|vfmadd[0-9a-z]*|shlx|sarx|shrx|andn|bzhi|mulx|tzcnt|lzcnt)\b|%[zy]mm[0-9]+' |
+			sort -u | tr '\n' ' ' || true)
+		if [[ -n ${hits} ]]; then
+			printf '  ABOVE BASELINE: %s -> %s\n' "${f#"${tmp}/"}" "${hits}" >&2
+			offenders=$((offenders + 1))
+		fi
+	done < <(find "${tmp}" -type f)
+
+	(( scanned > 0 )) || die "found no ELF objects to check in the package"
+	(( offenders == 0 )) ||
+		die "${offenders} object(s) use instructions above the x86-64 baseline -- makepkg.kedra.conf was not honoured"
+	msg2 "ISA check: ${scanned} ELF objects, none using AVX/AVX2/AVX-512/BMI or ymm/zmm"
+
+	# Corroborate from the recorded build metadata rather than only the code.
+	local bi
+	bi=$(bsdtar -xOf "${pkg}" .BUILDINFO 2>/dev/null | grep -E '^(buildenv|options|packager)' || true)
+	if bsdtar -xOf "${pkg}" .BUILDINFO 2>/dev/null | grep -q 'march=native'; then
+		die ".BUILDINFO records -march=native"
+	fi
+	msg2 "no -march=native recorded in .BUILDINFO"
+	[[ -n ${bi} ]] && printf '%s\n' "${bi}" >&2
+}
+verify_baseline
+
+msg "package verified: $(basename "${pkg}")"
+
+if (( publish )); then
+	[[ -x ${KEDRA_REPO_TOOLS}/kedra-repo-publish ]] ||
+		die "kedra-repo-publish not found at ${KEDRA_REPO_TOOLS}"
+	msg "publishing into [kedra]"
+	"${KEDRA_REPO_TOOLS}/kedra-repo-publish" "${pkg}"
+fi
+
+if (( ! keep )); then
+	msg "removing the build root (pass --keep to retain it)"
+	nsrm "${KEDRA_BUILDROOT}"
+fi

@@ -1,0 +1,5 @@
+---
+type:       "job"
+name:       "kedraexperiencepackages"
+interface:  "python"
+script:     "main.py"

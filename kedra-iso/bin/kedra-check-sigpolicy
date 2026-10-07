@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# kedra-check-sigpolicy -- assert that a pacman configuration does not weaken
+# package signature verification for any repository.
+#
+#   kedra-check-sigpolicy [--label NAME] [--quiet] CONFIG
+#
+# WHY THIS EXISTS
+# ---------------
+# The first version of this check grepped for the literal string
+#
+#     SigLevel = Never
+#
+# and passed the live ISO configuration, which contained
+#
+#     [cachyos]
+#     SigLevel = Optional TrustAll
+#
+# `Optional` accepts an unsigned package and `TrustAll` accepts a signature made
+# by a key the keyring does not trust, so that stanza disabled package validation
+# for the CachyOS repositories just as effectively as `Never` would have -- while
+# matching no forbidden string. Grepping for one spelling of a policy cannot
+# work: pacman offers Never / Optional / TrustAll, each optionally prefixed with
+# Package or Database, in any order, spread over several lines, and inherited
+# from [options] when a repository says nothing at all.
+#
+# HOW IT WORKS
+# ------------
+# The policy is therefore not parsed here. `pacman-conf` is pacman's own
+# configuration reader, and it prints the EFFECTIVE, fully normalised level for
+# any repository:
+#
+#     SigLevel = Optional TrustAll
+#       -> PackageOptional PackageTrustAll DatabaseOptional DatabaseTrustAll
+#     SigLevel = Never
+#       -> PackageNever DatabaseNever
+#
+# so every spelling collapses to the same four token slots and one set of
+# assertions covers all of them. A repository that overrides nothing prints
+# nothing, and inherits [options].
+#
+# WHAT IS REQUIRED
+# ----------------
+#   PackageRequired     a package must carry a signature
+#   PackageTrustedOnly  that signature must chain to a trusted key
+#   DatabaseTrustedOnly a database signature, if present, must likewise be trusted
+#
+# DatabaseRequired is deliberately NOT required: Arch, CachyOS and [kedra] all
+# ship DatabaseOptional, and tightening it is a separate decision (see
+# kedra-repo/config/pacman.conf.kedra-section).
+#
+# LocalFileSigLevel is deliberately NOT checked. It governs `pacman -U` on a file
+# the operator hands to pacman directly; it has no effect on packages fetched
+# from a repository, and `LocalFileSigLevel = Optional` is the Arch default that
+# makepkg-based workflows rely on. Rejecting it would be a false positive.
+#
+# The CONFIG must already have any build-time placeholders substituted --
+# pacman-conf resolves paths such as GPGDir and will refuse a template.
+
+set -euo pipefail
+
+label=""
+quiet=0
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--label) label=$2; shift 2 ;;
+		--quiet) quiet=1; shift ;;
+		-h|--help) sed -n '2,6p' "$0"; exit 0 ;;
+		--) shift; break ;;
+		-*) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+		*) break ;;
+	esac
+done
+
+[[ $# -eq 1 ]] || { printf 'usage: %s [--label NAME] [--quiet] CONFIG\n' "${0##*/}" >&2; exit 2; }
+conf=$1
+label=${label:-${conf}}
+
+[[ -r ${conf} ]] || { printf '  \033[1;31mFAIL\033[0m %s: not readable\n' "${label}"; exit 1; }
+command -v pacman-conf >/dev/null ||
+	{ printf '  \033[1;31mFAIL\033[0m pacman-conf is unavailable; cannot evaluate signature policy\n'; exit 1; }
+
+fail=0
+ok()  { (( quiet )) || printf '  \033[1;32mPASS\033[0m %s\n' "$*"; }
+bad() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; fail=1; }
+
+# --- required tokens -------------------------------------------------------
+readonly -a REQUIRED_TOKENS=(PackageRequired PackageTrustedOnly DatabaseTrustedOnly)
+
+# Tokens that, if present, name the weakening in the failure message. Purely
+# diagnostic: the assertion above is what decides pass/fail.
+name_weakening() {
+	local lvl=$1 found=()
+	[[ ${lvl} == *PackageNever*     ]] && found+=("PackageNever: signatures not checked at all")
+	[[ ${lvl} == *PackageOptional*  ]] && found+=("PackageOptional: unsigned packages accepted")
+	[[ ${lvl} == *PackageTrustAll*  ]] && found+=("PackageTrustAll: untrusted signing keys accepted")
+	[[ ${lvl} == *DatabaseNever*    ]] && found+=("DatabaseNever: database signature not checked")
+	[[ ${lvl} == *DatabaseTrustAll* ]] && found+=("DatabaseTrustAll: untrusted database signature accepted")
+	if (( ${#found[@]} )); then
+		printf '%s' "${found[0]}"
+		printf '; %s' "${found[@]:1}"
+	else
+		printf 'missing a required token'
+	fi
+}
+
+assert_level() {
+	local what=$1 lvl=$2 t
+	for t in "${REQUIRED_TOKENS[@]}"; do
+		if [[ ${lvl} != *"${t}"* ]]; then
+			bad "${label}: ${what} -> ${lvl:-<empty>} [$(name_weakening "${lvl}")]"
+			return
+		fi
+	done
+	ok "${label}: ${what} -> ${lvl}"
+}
+
+# --- global ----------------------------------------------------------------
+if ! global=$(pacman-conf --config "${conf}" SigLevel 2>&1 | tr '\n' ' '); then
+	bad "${label}: pacman-conf could not parse it: ${global}"
+	exit 1
+fi
+global=${global% }
+assert_level "[options] SigLevel" "${global}"
+
+# --- every repository ------------------------------------------------------
+mapfile -t repos < <(pacman-conf --config "${conf}" --repo-list 2>/dev/null)
+(( ${#repos[@]} )) || bad "${label}: declares no repositories"
+
+for r in "${repos[@]}"; do
+	# Empty output means the repository overrides nothing and inherits [options],
+	# which is the outcome we want for CachyOS and Arch. It is NOT an error.
+	lvl=$(pacman-conf --config "${conf}" --repo="${r}" SigLevel 2>/dev/null | tr '\n' ' ')
+	lvl=${lvl% }
+	if [[ -z ${lvl} ]]; then
+		ok "${label}: [${r}] inherits [options] (no override)"
+	else
+		assert_level "[${r}] SigLevel" "${lvl}"
+	fi
+done
+
+exit "${fail}"

@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+Boot a Kedra ISO under QEMU/KVM and verify the live system from the inside.
+
+The ISO is booted the way a user would boot it: x86_64, UEFI (OVMF), through
+GRUB, with no kernel command line injected and no direct kernel boot. Nothing
+about the image is modified for testing.
+
+Verification uses the QEMU guest agent rather than screen-scraping. The live
+package list already contains qemu-guest-agent, and its udev rule starts it as
+root as soon as the org.qemu.guest_agent.0 virtio port appears -- so simply
+attaching that port gives a real command channel into the booted system. The
+checks themselves are an ordinary shell script pushed in over the same channel.
+
+Screenshots are captured over QMP as evidence that the bootloader and the
+graphical session really rendered.
+
+Usage:  tests/kedra-iso-testvm <iso> [-o outdir] [--no-kvm] [--timeout N]
+"""
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+OVMF_CODE = "/usr/share/edk2/x64/OVMF_CODE.4m.fd"
+OVMF_VARS = "/usr/share/edk2/x64/OVMF_VARS.4m.fd"
+
+
+def log(msg):
+    print(f"\033[1;34m==>\033[0m {msg}", flush=True)
+
+
+class Sock:
+    """Line-delimited JSON over a unix socket (QMP and QGA both speak it)."""
+
+    def __init__(self, path, timeout=10):
+        self.path = path
+        self.buf = b""
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+        self.s.connect(path)
+
+    def send(self, obj):
+        self.s.sendall(json.dumps(obj).encode() + b"\n")
+
+    def recv(self, timeout=10):
+        self.s.settimeout(timeout)
+        while b"\n" not in self.buf:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise EOFError("socket closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        # guest-sync-delimited answers are prefixed with a 0xFF marker byte, and
+        # a resynchronising agent may emit stray 0xFF bytes of its own. They are
+        # framing, not JSON: strip them or every reply fails to parse.
+        line = line.replace(b"\xff", b"").strip()
+        if not line:
+            return {}
+        return json.loads(line)
+
+    def command(self, name, timeout=10, **args):
+        """Send a command and return its return value, skipping async events."""
+        msg = {"execute": name}
+        if args:
+            msg["arguments"] = args
+        self.send(msg)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            reply = self.recv(timeout=max(1, deadline - time.time()))
+            if "error" in reply:
+                raise RuntimeError(f"{name}: {reply['error']}")
+            if "return" in reply:
+                return reply["return"]
+            # otherwise an event/greeting; keep reading
+        raise TimeoutError(name)
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def wait_for_path(path, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def qga_connect(path, timeout):
+    """Connect to the guest agent and wait until it answers a sync."""
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            qga = Sock(path, timeout=5)
+            # guest-sync-delimited is the documented way to get back in step
+            # with an agent whose state is unknown.
+            token = int(time.time() * 1000) & 0x7FFFFFFF
+            qga.s.sendall(b"\xff")
+            qga.send({"execute": "guest-sync-delimited", "arguments": {"id": token}})
+            deadline_sync = time.time() + 8
+            while time.time() < deadline_sync:
+                try:
+                    raw = qga.recv(timeout=4)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                except socket.timeout:
+                    break
+                if raw.get("return") == token:
+                    return qga
+            qga.close()
+        except (OSError, EOFError, TimeoutError, ValueError):
+            pass
+        time.sleep(3)
+        if attempt % 10 == 0:
+            log(f"  still waiting for the guest agent ({int(deadline - time.time())}s left)")
+    return None
+
+
+def qga_write_file(qga, path, data: bytes):
+    h = qga.command("guest-file-open", path=path, mode="w")
+    try:
+        for i in range(0, len(data), 48000):
+            qga.command(
+                "guest-file-write",
+                handle=h,
+                **{"buf-b64": base64.b64encode(data[i:i + 48000]).decode()},
+            )
+    finally:
+        qga.command("guest-file-close", handle=h)
+
+
+def qga_run(qga, argv, timeout=600):
+    pid = qga.command(
+        "guest-exec", path=argv[0], arg=argv[1:], **{"capture-output": True}
+    )["pid"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        st = qga.command("guest-exec-status", timeout=30, pid=pid)
+        if st.get("exited"):
+            out = base64.b64decode(st.get("out-data", "")).decode("utf-8", "replace")
+            err = base64.b64decode(st.get("err-data", "")).decode("utf-8", "replace")
+            return st.get("exitcode", -1), out, err
+        time.sleep(2)
+    raise TimeoutError(f"guest command timed out: {argv}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("iso")
+    ap.add_argument("-o", "--outdir", default="testvm-out")
+    ap.add_argument("--no-kvm", action="store_true")
+    ap.add_argument("--timeout", type=int, default=600,
+                    help="seconds to wait for the guest agent")
+    ap.add_argument("--script", default="kedra-live-checks.sh",
+                    help="check script to run inside the guest, relative to "
+                         "tests/ or an absolute path")
+    ap.add_argument("--memory", default="4096")
+    ap.add_argument("--cpus", default="4")
+    args = ap.parse_args()
+
+    iso = os.path.abspath(args.iso)
+    if not os.path.exists(iso):
+        sys.exit(f"no such ISO: {iso}")
+    out = os.path.abspath(args.outdir)
+    os.makedirs(out, exist_ok=True)
+
+    checks = args.script
+    if not os.path.isabs(checks):
+        checks = os.path.join(os.path.dirname(os.path.abspath(__file__)), checks)
+    if not os.path.exists(checks):
+        sys.exit(f"no such check script: {checks}")
+
+    kvm = not args.no_kvm and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    log(f"acceleration: {'KVM' if kvm else 'TCG (software emulation)'}")
+
+    # virtio-gpu lives in a separate qemu-hw-display-* module on Arch and is not
+    # always installed. Standard VGA still gives the guest a KMS device
+    # (bochs-drm), which is what GNOME actually needs; it just renders through
+    # llvmpipe instead of virgl. Detect rather than assume, so the harness works
+    # on a plain qemu install.
+    have_devices = subprocess.run(
+        ["qemu-system-x86_64", "-device", "help"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    if "virtio-gpu-pci" in have_devices:
+        gpu_args = ["-device", "virtio-gpu-pci", "-vga", "none"]
+        log("display: virtio-gpu")
+    else:
+        gpu_args = ["-vga", "std"]
+        log("display: standard VGA (bochs-drm + llvmpipe); virtio-gpu unavailable")
+
+    vars_copy = os.path.join(out, "OVMF_VARS.fd")
+    shutil.copyfile(OVMF_VARS, vars_copy)
+
+    qmp_sock = os.path.join(out, "qmp.sock")
+    qga_sock = os.path.join(out, "qga.sock")
+    for p in (qmp_sock, qga_sock):
+        if os.path.exists(p):
+            os.unlink(p)
+
+    cmd = [
+        "qemu-system-x86_64",
+        "-name", "kedra-live-test",
+        "-machine", "q35" + (",accel=kvm" if kvm else ",accel=tcg"),
+        "-cpu", "host" if kvm else "qemu64",
+        "-smp", args.cpus,
+        "-m", args.memory,
+        # UEFI, matching the primary acceptance environment.
+        "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={OVMF_CODE}",
+        "-drive", f"if=pflash,format=raw,unit=1,file={vars_copy}",
+        # The ISO exactly as built, as a bootable optical device.
+        "-drive", f"file={iso},media=cdrom,readonly=on,if=none,id=cd0",
+        "-device", "ide-cd,drive=cd0,bootindex=0",
+        "-boot", "order=d,menu=off",
+        "-display", "none",
+        # User networking: gives the guest real outbound connectivity for the
+        # NetworkManager and repository checks.
+        *gpu_args,
+        "-netdev", "user,id=net0",
+        "-device", "virtio-net-pci,netdev=net0",
+        "-device", "virtio-rng-pci",
+        # Command channel. The live image's udev rule starts qemu-guest-agent
+        # automatically once this port appears.
+        "-device", "virtio-serial",
+        "-chardev", f"socket,path={qga_sock},server=on,wait=off,id=qga0",
+        "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+        "-qmp", f"unix:{qmp_sock},server=on,wait=off",
+        "-serial", f"file:{os.path.join(out, 'serial.log')}",
+        "-no-reboot",
+    ]
+
+    log("starting QEMU")
+    with open(os.path.join(out, "qemu.log"), "wb") as qemu_log:
+        vm = subprocess.Popen(cmd, stdout=qemu_log, stderr=subprocess.STDOUT)
+
+    results = {}
+    try:
+        if not wait_for_path(qmp_sock, 30):
+            raise RuntimeError("QMP socket never appeared; see qemu.log")
+        qmp = Sock(qmp_sock, timeout=15)
+        qmp.recv()                      # greeting
+        qmp.command("qmp_capabilities")
+
+        shots = []
+
+        def screenshot(tag):
+            path = os.path.join(out, f"screen-{tag}.ppm")
+            png = os.path.join(out, f"screen-{tag}.png")
+            try:
+                qmp.command("screendump", timeout=30, filename=path)
+                if shutil.which("magick"):
+                    subprocess.run(["magick", path, png], check=False)
+                    if os.path.exists(png):
+                        os.unlink(path)
+                        shots.append(png)
+                        return png
+                shots.append(path)
+                return path
+            except Exception as exc:                      # noqa: BLE001
+                log(f"  screenshot {tag} failed: {exc}")
+                return None
+
+        # Early screenshot: the bootloader menu should still be on screen.
+        time.sleep(6)
+        screenshot("01-bootloader")
+        time.sleep(20)
+        screenshot("02-boot")
+
+        log(f"waiting for the guest agent (up to {args.timeout}s)")
+        t0 = time.time()
+        qga = qga_connect(qga_sock, args.timeout)
+        if qga is None:
+            screenshot("99-no-agent")
+            raise RuntimeError(
+                "guest agent never responded; the live system may not have "
+                "reached userspace. See screenshots and serial.log."
+            )
+        boot_secs = time.time() - t0
+        log(f"guest agent responded after {boot_secs:.0f}s")
+        results["agent_seconds"] = round(boot_secs)
+
+        # Give GDM/GNOME a moment to finish drawing before the desktop shot.
+        time.sleep(45)
+        screenshot("03-desktop")
+
+        log("pushing check script into the guest")
+        with open(checks, "rb") as fh:
+            qga_write_file(qga, "/tmp/kedra-checks.sh", fh.read())
+
+        log("running live-system checks (this includes a pacman -Sy)")
+        rc, out_text, err_text = qga_run(
+            qga, ["/bin/sh", "/tmp/kedra-checks.sh"], timeout=900
+        )
+        report = os.path.join(
+            out, os.path.basename(checks).rsplit(".", 1)[0] + ".txt")
+        with open(report, "w") as fh:
+            fh.write(out_text)
+            if err_text:
+                fh.write("\n===== stderr =====\n" + err_text)
+        log(f"checks finished (exit {rc}); wrote {report}")
+        results["checks"] = report
+        results["exitcode"] = rc
+
+        screenshot("04-after-checks")
+        results["screenshots"] = shots
+
+        # Leave the VM in a clean state rather than killing it mid-write.
+        try:
+            qga.command("guest-shutdown", timeout=5, mode="powerdown")
+        except Exception:                                 # noqa: BLE001
+            pass
+        time.sleep(8)
+    finally:
+        if vm.poll() is None:
+            vm.terminate()
+            try:
+                vm.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                vm.kill()
+
+    print(json.dumps(results, indent=2))
+    return 0 if results.get("exitcode") == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

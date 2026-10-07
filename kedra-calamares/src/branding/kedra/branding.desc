@@ -1,0 +1,70 @@
+---
+# Kedra Linux branding component.
+#
+# Downstream of the CachyOS branding component. Everything here that is not a
+# product string is upstream's, unchanged.
+#
+# The visual identity is DELIBERATELY MINIMAL and placeholder-only: Kedra has no
+# final logo, wallpaper or theme yet, and inventing one here would have to be
+# undone later. The slideshow is therefore plain text rather than artwork, and
+# the logo/icon/welcome images are generated wordmarks (see
+# packaging/kedra-branding-images). Replacing them is a drop-in file swap; no
+# configuration below depends on their content.
+#
+# The CachyOS slide artwork was removed rather than reused: it says "Welcome to
+# CachyOS" in the image itself, which no amount of configuration can rebrand.
+
+componentName:  kedra
+
+welcomeStyleCalamares:   false
+
+welcomeExpandingLogo:   true
+
+windowExpanding:    normal
+
+windowSize: 1100px,520px
+
+windowPlacement: center
+
+sidebar: qml,bottom
+
+navigation: widget
+
+strings:
+    productName:         Kedra Linux
+    shortProductName:    Kedra
+    version:             rolling
+    shortVersion:        rolling
+    versionedName:       Kedra Linux
+    shortVersionedName:  Kedra
+    # Used verbatim as GRUB_DISTRIBUTOR by the grubcfg module and as the
+    # systemd-boot entry title by the bootloader module, so this string is what
+    # the installed boot menu says.
+    #
+    # "Kedra", NOT "Kedra Linux". GRUB's own 10_linux generator composes menu
+    # entries as "${GRUB_DISTRIBUTOR} Linux", so "Kedra Linux" here produced a
+    # boot menu reading "Kedra Linux Linux" on the first installed system. This is
+    # also why Arch ships GRUB_DISTRIBUTOR="Arch" and CachyOS ships "CachyOS"
+    # rather than their full product names.
+    bootloaderEntryName: Kedra
+
+images:
+    productLogo:         "logo.png"
+    productIcon:         "icon.png"
+    productWelcome:      "welcome.png"
+
+style:
+   SidebarBackground:        "#1D2126"
+   SidebarText:              "#FFFFFF"
+   SidebarTextCurrent:       "#1D2126"
+   SidebarBackgroundCurrent: "#5AA9E6"
+
+slideshow:               "show.qml"
+slideshowAPI: 2
+
+# No uploadServer.
+#
+# Upstream points this at https://paste.cachyos.org. Kedra installation logs are
+# not CachyOS's to host, and there is no Kedra endpoint to send them to yet, so
+# the "upload log" affordance stays off rather than pointing somewhere wrong.
+# Restoring it is one stanza once Kedra hosting exists.

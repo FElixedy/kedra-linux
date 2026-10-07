@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+#
+# Static validation of the Kedra ISO profile. Runs in seconds and needs no root,
+# so it can be run before committing an hour to a real build.
+#
+# It answers the questions an ISO build cannot answer cheaply:
+#   * does the package list actually resolve, with [kedra] at top priority?
+#   * does each Kedra package come from [kedra] and each CachyOS/Arch package
+#     still come from its own repository?
+#   * is signature verification still enabled everywhere?
+#   * is the live desktop free of the Plasma session it replaced?
+#   * did any secret key material leak into the profile?
+#
+# Everything happens in a throwaway root under /tmp. The host's pacman
+# databases, keyring and configuration are never read for trust and never
+# written.
+
+set -euo pipefail
+
+_src_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=bin/_kedra.sh
+source "${_src_dir}/_kedra.sh"
+
+profile="${_KEDRA_ISO_ROOT}/archiso"
+work=$(mktemp -d -t kedra-iso-validate-XXXXXX)
+trap 'rm -rf -- "${work}"' EXIT
+
+fail=0
+ok()   { printf '  \033[1;32mPASS\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; fail=1; }
+head() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+
+head "ISO identity (profiledef.sh)"
+# `file_permissions` is an associative array, so profiledef.sh must be sourced
+# with it already declared -- exactly as mkarchiso does. Sourcing it without
+# that turns the first subscript into an arithmetic expression and aborts.
+declare -A file_permissions=()
+# shellcheck disable=SC1091
+source "${profile}/profiledef.sh"
+[[ ${iso_name} == kedra ]]          && ok "iso_name=${iso_name}"               || bad "iso_name=${iso_name}, expected kedra"
+[[ ${iso_label} == KEDRA_* ]]       && ok "iso_label=${iso_label}"             || bad "iso_label=${iso_label}, expected KEDRA_*"
+[[ ${iso_publisher} == *Kedra* ]]   && ok "iso_publisher=${iso_publisher}"     || bad "iso_publisher=${iso_publisher}"
+[[ ${iso_application} == *Kedra* ]] && ok "iso_application=${iso_application}" || bad "iso_application=${iso_application}"
+[[ ${iso_publisher}${iso_application} != *kedra.org* ]] &&
+    ok "no invented Kedra domain in ISO metadata" || bad "ISO metadata contains an invented domain"
+
+head "Identity ownership"
+for f in etc/os-release etc/cachyos-release; do
+    [[ -e "${profile}/airootfs/${f}" ]] &&
+        bad "airootfs/${f} exists - competes with kedra-hooks for distro identity" ||
+        ok  "airootfs/${f} absent - kedra-hooks owns identity"
+done
+grep -q '^kedra-hooks$'   "${profile}/packages_desktop.x86_64" && ok "kedra-hooks in package list"   || bad "kedra-hooks missing"
+grep -q '^kedra-keyring$' "${profile}/packages_desktop.x86_64" && ok "kedra-keyring in package list" || bad "kedra-keyring missing"
+grep -q '^kedra-calamares$' "${profile}/packages_desktop.x86_64" && ok "kedra-calamares in package list" || bad "kedra-calamares missing"
+grep -q '^cachyos-hooks$' "${profile}/packages_desktop.x86_64" &&
+    bad "cachyos-hooks still listed - conflicts with kedra-hooks" ||
+    ok  "cachyos-hooks not listed"
+grep -qE '^cachyos-calamares' "${profile}/packages_desktop.x86_64" &&
+    bad "a cachyos-calamares variant is still listed - conflicts with kedra-calamares" ||
+    ok  "no cachyos-calamares variant listed"
+
+head "Signature verification"
+# This block used to grep each config for `SigLevel = Never`. That check passed
+# the M0 live ISO, which weakened [cachyos] to `Optional TrustAll` -- a policy
+# just as permissive, spelled differently. Policy is now evaluated, not matched:
+# bin/kedra-check-sigpolicy asks pacman-conf for the EFFECTIVE level of every
+# repository, including the ones that inherit it from [options]. Its own
+# behaviour is pinned by tests/kedra-sigpolicy-tests.sh.
+#
+# All three configs are checked. Only airootfs/etc/pacman.conf carried the
+# weakening, but it was the one config the old check happened not to look at
+# closely, and nothing structural had kept it out of the other two.
+sigpolicy_conf="${work}/sigpolicy"
+mkdir -p "${sigpolicy_conf}"
+# The build-time profile is a template; pacman-conf resolves GPGDir and refuses
+# an unsubstituted placeholder. Substitute exactly as mkarchiso does.
+sed -e "s|@KEDRA_ISO_GPGDIR@|${KEDRA_ISO_GPGDIR}|g" \
+    -e "s|@KEDRA_ISO_CACHEDIR@|${KEDRA_ISO_CACHEDIR}|g" \
+    -e "s|@KEDRA_REPO_ROOT@|${KEDRA_REPO_ROOT}|g" \
+    "${profile}/pacman.conf" > "${sigpolicy_conf}/build.conf"
+cp "${profile}/airootfs/etc/pacman.conf"      "${sigpolicy_conf}/live.conf"
+cp "${profile}/airootfs/etc/pacman-more.conf" "${sigpolicy_conf}/more.conf"
+
+"${_src_dir}/kedra-check-sigpolicy" --label "archiso/pacman.conf (build)"      "${sigpolicy_conf}/build.conf" || fail=1
+"${_src_dir}/kedra-check-sigpolicy" --label "airootfs/etc/pacman.conf (live)"  "${sigpolicy_conf}/live.conf"  || fail=1
+"${_src_dir}/kedra-check-sigpolicy" --label "airootfs/etc/pacman-more.conf"    "${sigpolicy_conf}/more.conf"  || fail=1
+
+# [kedra] specifically must state Required rather than merely inherit it: it is
+# the repository whose trust root is newest and least widely held.
+for conf in "${sigpolicy_conf}/build.conf" "${sigpolicy_conf}/live.conf"; do
+    lvl=$(pacman-conf --config "${conf}" --repo=kedra SigLevel 2>/dev/null | tr '\n' ' ')
+    [[ ${lvl} == *PackageRequired*PackageTrustedOnly* || ${lvl} == *PackageTrustedOnly*PackageRequired* ]] &&
+        ok "[kedra] states its own Required policy in ${conf##*/}" ||
+        bad "[kedra] does not state Required explicitly in ${conf##*/}: ${lvl:-<inherited>}"
+done
+
+if "${_src_dir}/../tests/kedra-sigpolicy-tests.sh" >"${work}/sigpolicy-tests.log" 2>&1; then
+    ok "signature-policy checker self-tests: $(grep -oE '[0-9]+ passed, [0-9]+ failed' "${work}/sigpolicy-tests.log" | tail -1)"
+else
+    bad "signature-policy checker self-tests FAILED:"; sed 's/^/    /' "${work}/sigpolicy-tests.log"
+fi
+
+head "Installer artifact contents"
+# M0.1 EXISTS BECAUSE OF THIS CHECK BEING ABSENT.
+#
+# kedra-calamares 3.4.2-1 was published from a tree that predated the commit
+# fixing branding.desc, then republished during development WITHOUT a pkgrel
+# bump -- so source said `bootloaderEntryName: Kedra` while the artifact in
+# [kedra], and therefore the ISO, still said `Kedra Linux`, and the installed
+# boot menu read "Kedra Linux Linux".
+#
+# Inspecting the source would not have caught that. The PACKAGE is opened.
+#
+# The package is located through kedra.db rather than by picking the newest
+# file on disk: the database is what pacman resolves, the docroot deliberately
+# retains superseded releases (3.4.2-1 is still there), and an mtime sort would
+# happily validate a package the ISO is never going to install.
+_caldb=$(bsdtar -xOf "${KEDRA_REPO_DIR}/${KEDRA_REPO_NAME}.db" \
+    --include '*/desc' 2>/dev/null |
+    awk '/^%FILENAME%/{getline f} /^%NAME%/{getline n; if (n == "kedra-calamares") {print f; exit}}')
+_cal="${KEDRA_REPO_DIR}/${_caldb}"
+if [[ -z ${_caldb} || ! -f ${_cal} ]]; then
+    bad "kedra.db names no installable kedra-calamares package in ${KEDRA_REPO_DIR}"
+else
+    ok "installer artifact: ${_cal##*/}"
+    _calver=$(bsdtar -xOqf "${_cal}" .PKGINFO | awk -F' = ' '$1 == "pkgver" {print $2; exit}')
+    ok "installer artifact version: ${_calver}"
+
+    _entry=$(bsdtar -xOqf "${_cal}" usr/share/calamares/branding/kedra/branding.desc 2>/dev/null |
+        sed -n 's/^[[:space:]]*bootloaderEntryName:[[:space:]]*//p')
+    if [[ -z ${_entry} ]]; then
+        bad "branding.desc in the artifact declares no bootloaderEntryName"
+    elif [[ ${_entry} == "Kedra" ]]; then
+        ok "artifact bootloaderEntryName is 'Kedra' (GRUB composes 'Kedra Linux')"
+    else
+        bad "artifact bootloaderEntryName is '${_entry}', expected 'Kedra' -- GRUB would compose '${_entry} Linux'"
+    fi
+
+    # The artifact must match the source tree it claims to come from, which is
+    # the provenance property that was actually broken.
+    _srcentry=$(sed -n 's/^[[:space:]]*bootloaderEntryName:[[:space:]]*//p' \
+        "${_KEDRA_ISO_ROOT}/../kedra-calamares/src/branding/kedra/branding.desc" 2>/dev/null)
+    if [[ -z ${_srcentry} ]]; then
+        printf '  \033[1;33mSKIP\033[0m kedra-calamares checkout not found; cannot compare artifact to source\n'
+    elif [[ ${_entry} == "${_srcentry}" ]]; then
+        ok "artifact branding matches kedra-calamares source ('${_srcentry}')"
+    else
+        bad "artifact branding '${_entry}' does NOT match source '${_srcentry}' -- the package is stale"
+    fi
+
+    # A detached signature must exist and verify against the build keyring.
+    if [[ -f ${_cal}.sig ]]; then
+        gpg --homedir "${KEDRA_ISO_GPGDIR}" --no-permission-warning \
+            --verify "${_cal}.sig" "${_cal}" >/dev/null 2>&1 &&
+            ok "installer artifact signature verifies against the build keyring" ||
+            bad "installer artifact signature does NOT verify"
+    else
+        bad "installer artifact has no detached signature"
+    fi
+fi
+
+head "No secret key material in the profile"
+if find "${profile}" \( -name '*.key' -o -name 'secring*' -o -name '*.gpg' \) -print | grep -q .; then
+    bad "key-like files found under archiso/:"
+    find "${profile}" \( -name '*.key' -o -name 'secring*' -o -name '*.gpg' \) -print
+else
+    ok "no key-like files under archiso/"
+fi
+
+head "Live desktop is GNOME, not Plasma"
+plasma=$(grep -cE '^(plasma-|kde-|breeze|dolphin|konsole|kate$|kcalc$|kscreen$|kinfocenter$|spectacle$|bluedevil$|polkit-kde-agent$)' \
+    "${profile}/packages_desktop.x86_64" || true)
+(( plasma == 0 )) && ok "no Plasma session packages remain" || bad "${plasma} Plasma package(s) still listed"
+for p in gdm gnome-shell gnome-control-center nautilus gnome-console; do
+    grep -q "^${p}$" "${profile}/packages_desktop.x86_64" && ok "${p} present" || bad "${p} missing"
+done
+grep -q '^networkmanager$' "${profile}/packages_desktop.x86_64" && ok "networkmanager present" || bad "networkmanager missing"
+
+head "CachyOS technical value preserved"
+for p in linux-cachyos linux-cachyos-lts cachyos-settings cachyos-keyring cachyos-rate-mirrors chwd cachyos-mirrorlist; do
+    grep -q "^${p}$" "${profile}/packages_desktop.x86_64" && ok "${p} preserved" || bad "${p} was dropped"
+done
+
+head "Repository resolution (throwaway pacman root)"
+[[ -d ${KEDRA_ISO_GPGDIR} ]] ||
+    { bad "build keyring missing - run: fakeroot ./bin/kedra-iso-keyring-init"; exit 1; }
+[[ -f ${KEDRA_REPO_DIR}/${KEDRA_REPO_NAME}.db ]] ||
+    { bad "[kedra] docroot has no ${KEDRA_REPO_NAME}.db at ${KEDRA_REPO_DIR}"; exit 1; }
+
+# Reproduce mkarchiso's _make_pacman_conf: substitute the Kedra placeholders,
+# expand with pacman-conf, strip the settings that break `pacman -r`.
+sed -e "s|@KEDRA_ISO_GPGDIR@|${KEDRA_ISO_GPGDIR}|g" \
+    -e "s|@KEDRA_ISO_CACHEDIR@|${work}/cache|g" \
+    -e "s|@KEDRA_REPO_ROOT@|${KEDRA_REPO_ROOT}|g" \
+    "${profile}/pacman.conf" > "${work}/profile.conf"
+pacman-conf --config "${work}/profile.conf" |
+    sed "/CacheDir/d;/DBPath/d;/HookDir/d;/LogFile/d;/RootDir/d" > "${work}/effective.conf"
+
+order=$(grep '^\[' "${work}/effective.conf" | tr -d '[]' | grep -v '^options$' | paste -sd' ')
+[[ ${order} == "kedra cachyos core extra multilib" ]] &&
+    ok "repository order: ${order}" ||
+    bad "unexpected repository order: ${order}"
+
+mkdir -p "${work}/root/var/lib/pacman" "${work}/cache"
+# pacman refuses -S operations unless EUID is 0, even when every path it touches
+# is user-writable. fakeroot satisfies that check with no real privilege: the
+# throwaway root, database and cache below are all ordinary user-owned
+# directories, and the host's pacman state is never touched.
+pac=(fakeroot pacman --config "${work}/effective.conf" --root "${work}/root"
+     --dbpath "${work}/root/var/lib/pacman" --cachedir "${work}/cache"
+     --logfile "${work}/pacman.log" --noconfirm)
+
+printf '  syncing databases (network)...\n'
+"${pac[@]}" -Sy >"${work}/sync.log" 2>&1 ||
+    { bad "database sync failed:"; tail -20 "${work}/sync.log"; exit 1; }
+ok "all databases synced, including signed kedra.db"
+
+mapfile -t pkgs < <(grep -v '^\s*#' "${profile}/packages_desktop.x86_64" | grep -v '^\s*$')
+if "${pac[@]}" -Sp --print-format '%r/%n' "${pkgs[@]}" >"${work}/resolved.txt" 2>"${work}/resolve.err"; then
+    ok "package list resolves (${#pkgs[@]} requested, $(wc -l <"${work}/resolved.txt") with dependencies)"
+else
+    bad "package list does NOT resolve:"; tail -25 "${work}/resolve.err"
+fi
+
+if [[ -s ${work}/resolved.txt ]]; then
+    head "Which repository each package is taken from"
+    printf '  by repository: '
+    awk -F/ '{print $1}' "${work}/resolved.txt" | sort | uniq -c | sort -rn |
+        awk '{printf "%s=%s ", $2, $1}'; printf '\n'
+    for want in kedra/kedra-hooks kedra/kedra-keyring kedra/kedra-calamares; do
+        grep -qx "${want}" "${work}/resolved.txt" &&
+            ok "${want} resolves from [kedra]" ||
+            bad "${want} does NOT resolve from [kedra] ($(grep -E "/${want#*/}$" "${work}/resolved.txt" || echo absent))"
+    done
+    for want in linux-cachyos cachyos-settings cachyos-keyring; do
+        line=$(grep -E "/${want}$" "${work}/resolved.txt" || true)
+        [[ ${line} == cachyos/* ]] && ok "${want} still resolves from [cachyos]" ||
+            bad "${want} resolves from '${line:-absent}', expected [cachyos]"
+    done
+    for want in gnome-shell gdm nautilus; do
+        line=$(grep -E "/${want}$" "${work}/resolved.txt" || true)
+        [[ ${line} == core/* || ${line} == extra/* ]] &&
+            ok "${want} resolves from Arch (${line%%/*})" ||
+            bad "${want} resolves from '${line:-absent}', expected core/extra"
+    done
+    grep -q '^kedra/' "${work}/resolved.txt" &&
+        ok "[kedra] claims exactly: $(grep '^kedra/' "${work}/resolved.txt" | paste -sd' ')" ||
+        bad "[kedra] claims nothing"
+fi
+
+printf '\n'
+if (( fail )); then
+    printf '\033[1;31m==> validation FAILED\033[0m\n'; exit 1
+fi
+printf '\033[1;32m==> validation passed\033[0m\n'

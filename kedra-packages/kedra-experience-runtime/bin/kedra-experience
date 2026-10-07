@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Kedra Experience -- read-only profile queries.
+
+Installed entry point, shipped verbatim by kedra-experience-runtime. Nothing in
+this file is generated or substituted at build time: the library path below is a
+literal, so what runs on a Kedra system cannot depend on where the package was
+built or on how the interpreter was invoked.
+
+The library is at a private path rather than in site-packages on purpose. It is
+Kedra-internal, it is not a stable API for anything outside Kedra, and
+`import kedra_experience` from an unrelated program must keep failing.
+"""
+
+from __future__ import annotations
+
+import sys
+
+sys.path.insert(0, "/usr/lib/kedra/experience")
+
+from kedra_experience.prodcli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

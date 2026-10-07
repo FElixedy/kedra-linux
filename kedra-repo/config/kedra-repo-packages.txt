@@ -1,0 +1,70 @@
+# Allowlist of package names permitted in the [kedra] repository.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# [kedra] is configured ABOVE the CachyOS and Arch repositories so it can
+# intentionally replace packages such as cachyos-hooks. That priority means any
+# name published here silently overrides the Arch/CachyOS version of the same
+# name -- including, if someone were careless, `glibc` or `linux`.
+#
+# kedra-repo-publish refuses to add a package whose pkgname is not listed here.
+# Adding a name to this file is therefore the explicit, reviewable act of
+# claiming ownership of it.
+#
+# POLICY
+# ------
+# A name may be added only if Kedra genuinely owns it:
+#   1. it is a Kedra-original package (kedra-*), or
+#   2. it is a deliberate, documented replacement of a CachyOS/Arch package
+#      whose divergence is required for Kedra identity or behaviour.
+#
+# Kernels, CachyOS optimised builds and CachyOS performance packages are out of
+# scope by design: Kedra reuses them from the CachyOS repositories.
+#
+# One pkgname per line. `#` starts a comment.
+
+# --- Kedra-original packages ------------------------------------------------
+kedra-keyring
+kedra-hooks
+
+# The Kedra Experience layer. Four packages, split by what each one delivers,
+# because the split is what makes "Vanilla GNOME" a real product rather than
+# Kedra with its settings undone:
+#
+#   kedra-experience           the manifest tree under /usr/share/kedra/experience.
+#                              Read-only data: what a Kedra desktop is composed of.
+#   kedra-experience-runtime   the profile resolver and the read-only
+#                              /usr/bin/kedra-experience command that reads it.
+#   kedra-experience-desktop   one GSettings vendor override -- the fixed
+#                              five-workspace model.
+#   kedra-experience-workflow  one GSettings vendor override -- the Super+1..5
+#                              keymap.
+#
+# The two override packages are *defaults*, not configurators: they write into
+# nobody's dconf, so an explicit user value always wins and `pacman -R` restores
+# upstream GNOME with no revert step. A Vanilla installation simply does not have
+# them, which is why they are packaged separately from the metadata.
+#
+# All four are kedra-* originals under policy clause 1. None shadows an Arch or
+# CachyOS name, so [kedra]'s top priority replaces nothing here.
+kedra-experience
+kedra-experience-runtime
+kedra-experience-desktop
+kedra-experience-workflow
+
+# --- Deliberate replacements of CachyOS packages -----------------------------
+# kedra-calamares: the Kedra system installer, downstream of
+# cachyos-calamares-next. Kedra owns it because the installer decides the
+# product identity it presents, which repositories the installed system gets and
+# which packages are installed -- all three of which are Kedra decisions.
+#
+# It does NOT shadow the CachyOS name: the package is called kedra-calamares, and
+# it conflicts with cachyos-calamares-next only through the virtual `calamares`
+# name that both provide, which is correct since they own the same files. Nothing
+# published under this name can silently replace a CachyOS package on a CachyOS
+# system.
+kedra-calamares
+
+# --- Test-only packages (never published to a production repository) ---------
+# Used by kedra-repo's test suite to exercise the signed upgrade path.
+kedra-repo-selftest

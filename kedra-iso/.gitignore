@@ -1,0 +1,38 @@
+*~
+archiso-*.tar.gz*
+work/
+out/
+build/
+*.iso
+*.img
+*.cer
+*.crt
+*.key
+*.pem
+user-data
+meta-data
+*.qcow2
+archiso/packages.x86_64
+archiso/airootfs/etc/systemd/system/display-manager.service
+archiso/airootfs/etc/systemd/system/cachyos-rate-mirrors.timer
+archiso/airootfs/etc/motd
+archiso/airootfs/etc/environment
+archiso/airootfs/etc/pacman.d/cachyos-mirrorlist
+archiso/airootfs/etc/edition-tag
+archiso/airootfs/etc/version-tag
+
+# Kedra: build-local pacman keyring (bin/kedra-iso-keyring-init).
+# Trust material only, but regenerable and machine-local -- never committed.
+keyring/
+# Kedra: signed [kedra] docroot copied into the image at build time.
+archiso/airootfs/usr/share/kedra/
+archiso/airootfs/etc/systemd/system/archlinux-keyring-wkd-sync.timer
+
+# Milestone 0 installation-test VM artifacts (disk-backed, large)
+tests/installvm-out/
+# VM run artefacts: transcripts and screenshots of one acceptance run.
+tests/livevm-*/
+tests/rerunvm-*/
+tests/testvm-out/
+tests/install-vanilla/
+tests/install-kedra/

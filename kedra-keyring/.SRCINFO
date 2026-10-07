@@ -1,0 +1,17 @@
+pkgbase = kedra-keyring
+	pkgdesc = Kedra Linux PGP keyring
+	pkgver = 2026.08.14
+	pkgrel = 1
+	install = kedra-keyring.install
+	arch = any
+	groups = kedra
+	license = GPL-3.0-or-later
+	depends = pacman
+	source = kedra.gpg
+	source = kedra-trusted
+	source = kedra-revoked
+	sha256sums = SKIP
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+pkgname = kedra-keyring

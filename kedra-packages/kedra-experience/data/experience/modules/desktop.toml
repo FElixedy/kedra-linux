@@ -1,0 +1,115 @@
+# Kedra Experience module: desktop
+#
+# Owns *workspace topology* -- how many workspaces exist and whether that number
+# is fixed. It does not own how you move between them; that is the `workflow`
+# module's keyboard layer, which is built on top of the model declared here.
+#
+# Everything below is `policy = "default"`, delivered as a GSettings vendor
+# override by `kedra-experience-desktop`. Nothing is written to any user's
+# dconf, so an explicit user value always wins, and removing the package
+# restores upstream GNOME behaviour with nothing to revert.
+#
+# See docs/kedra-workspaces.md.
+
+schema_version = 6
+
+[module]
+id = "desktop"
+name = "Kedra Desktop"
+description = "Baseline Kedra GNOME shell behaviour: window management, workspaces and panel behaviour."
+# 0.4.0: user_selectable became true. A user-visible contract change, not a
+# correction -- what a Custom Kedra may express is different afterwards.
+version = "0.4.0"
+tier = "core"
+
+# The Kedra fixed five-workspace model is a Custom Kedra choice.
+#
+# `tier = "core"` and `user_selectable` are independent, and this module is the
+# case that shows why. Core says Kedra's curated experience is built around the
+# fixed workspace model; selectable says a user may still switch it off, keep
+# `workflow`, and be told what that costs -- which is exactly the
+# `works_best_with` advisory workflow declares against this module.
+#
+# It was `false` until 0.4.0, which contradicted the product contract and made
+# the only advisory the shipped tree declares unreachable from any selection.
+# Structural modules that genuinely are not the user's to switch stay false; see
+# `integration`, which carries the Experience layer's own delivery.
+user_selectable = true
+introduced_in = "0.1.0"
+
+# Module-to-module dependencies. These describe what this module needs in order
+# to be coherent — NOT whether any preset turns it on. Activation lives in
+# presets only.
+requires = []
+conflicts = []
+
+# Migration records (schema 3). Empty: these are this module's first settings,
+# so nothing has moved, been renamed or been withdrawn.
+migrations = []
+
+
+# ---------------------------------------------------------------------------
+# The Kedra fixed five-workspace model
+# ---------------------------------------------------------------------------
+#
+# Workspaces 1 to 5 always exist. This is deliberate Kedra Desktop product
+# behaviour, chosen on its own merits -- not a side effect of the Workflow
+# keymap, which is why it is declared here rather than there.
+#
+# Upstream GNOME manages workspaces dynamically: the count is however many are
+# occupied, plus one. Under that model a binding for workspace N is a valid
+# binding that simply does nothing while workspace N does not exist yet. A fixed
+# count makes "switch to workspace 4" mean the same thing at every moment of a
+# session, which is the property a numeric keyboard layer needs to be
+# predictable.
+#
+# Two keys, in two different schemas, and both are required: `num-workspaces` is
+# ignored entirely while workspaces are dynamic, and turning dynamic off without
+# setting a count would leave GNOME's own default of 4.
+
+[[module.settings]]
+id = "desktop-dynamic-workspaces"
+backend = "gsettings"
+policy = "default"
+description = "Fix the workspace count instead of growing and shrinking it, so a numbered workspace always exists."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.mutter", key = "dynamic-workspaces" }
+value = { type = "b", data = false }
+
+[[module.settings]]
+id = "desktop-workspace-count"
+backend = "gsettings"
+policy = "default"
+description = "Five workspaces, the Kedra Desktop model the Workflow numeric keymap is built for."
+introduced_in = "0.3.0"
+target = { schema = "org.gnome.desktop.wm.preferences", key = "num-workspaces" }
+value = { type = "i", data = 5 }
+
+# Packages this module relates to, and how strongly.
+#   required     — the module is broken without it
+#   recommended  — installed by default, module degrades without it
+#   optional     — enhances the module, never installed automatically
+#   conditional  — installed only when `condition` holds
+# Package relation strength is NOT activation state.
+[[module.packages]]
+name = "gnome-shell"
+relation = "required"
+reason = "Kedra Desktop configures GNOME Shell behaviour."
+
+[[module.packages]]
+name = "gnome-control-center"
+relation = "recommended"
+reason = "Users need Settings to override anything Kedra sets."
+
+# The delivery mechanism for the settings above, and the reason a profile
+# without this module genuinely keeps upstream GNOME workspace behaviour: the
+# override is simply not installed, rather than installed and then countermanded.
+[[module.packages]]
+name = "kedra-experience-desktop"
+relation = "required"
+reason = "Installs the GSettings vendor override rendered from this module's policy 'default' settings."
+
+# The packages providing the schemas themselves (mutter, gsettings-desktop-schemas)
+# are declared by kedra-experience-desktop, following the same split as
+# kedra-experience-workflow: a module names the GNOME components it configures,
+# its defaults package names the schemas its override must compile against.

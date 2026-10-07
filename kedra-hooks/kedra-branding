@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Run kedra hooks related commands.
+
+# Kedra Linux distro identity. Every key below is rewritten unconditionally on
+# each hook run, so an upstream package update (Arch filesystem/lsb-release, or
+# a leftover CachyOS-branded file on a converted system) can never leave a
+# foreign identity behind.
+KEDRA_NAME="Kedra Linux"
+KEDRA_PRETTY_NAME="Kedra Linux"
+KEDRA_ID="kedra"
+KEDRA_ID_LIKE="arch"
+# Placeholder until the branding workstream lands: this is the upstream Arch
+# default color, it is not a final Kedra value.
+KEDRA_ANSI_COLOR="38;2;23;147;209"
+# Icon name only. No logo asset is shipped by this package; the branding
+# workstream provides /usr/share/pixmaps/kedra.{svg,png} later.
+KEDRA_LOGO="kedra"
+# Kedra domains are not decided yet. An empty value removes the key from
+# os-release instead of inheriting the upstream URL or inventing a fake one;
+# filling one in here is enough to have it written back.
+KEDRA_HOME_URL=""
+KEDRA_DOCUMENTATION_URL=""
+KEDRA_SUPPORT_URL=""
+KEDRA_BUG_REPORT_URL=""
+# Same rule for the privacy policy: Kedra does not inherit the Arch/CachyOS one.
+KEDRA_PRIVACY_POLICY_URL=""
+
+# Set KEY=VALUE in a shell-style release file. An empty value drops the key.
+set_release_key() {
+    local file="$1" key="$2" value="$3"
+    if [ -z "$value" ]; then
+        sed -i "$file" -e "/^$key=/d"
+    elif grep -q "^$key=" "$file"; then
+        sed -i "$file" -e "s|^$key=.*$|$key=\"$value\"|"
+    else
+        printf '%s="%s"\n' "$key" "$value" >>"$file"
+    fi
+}
+
+update_lsb_release() {
+    sed -i /etc/lsb-release \
+        -e "s|^DISTRIB_ID=.*$|DISTRIB_ID=$KEDRA_ID|" \
+        -e "s|^DISTRIB_DESCRIPTION=.*$|DISTRIB_DESCRIPTION=\"$KEDRA_PRETTY_NAME\"|"
+}
+
+update_os_release() {
+    local os_release="/etc/os-release"
+
+    # The filesystem package only owns /usr/lib/os-release; /etc/os-release is
+    # the machine-local override that carries the Kedra identity across upstream
+    # updates. Seed it from the vendor file if it does not exist yet.
+    if [ ! -f "$os_release" ]; then
+        cp /usr/lib/os-release "$os_release"
+    fi
+
+    sed -i "$os_release" \
+        -e "s|^NAME=.*$|NAME=\"$KEDRA_NAME\"|" \
+        -e "s|^PRETTY_NAME=.*$|PRETTY_NAME=\"$KEDRA_PRETTY_NAME\"|" \
+        -e "s|^ID=.*$|ID=$KEDRA_ID|" \
+        -e "s|^ID_LIKE=.*$|ID_LIKE=$KEDRA_ID_LIKE|" \
+        -e "s|^ANSI_COLOR=.*$|ANSI_COLOR=\"$KEDRA_ANSI_COLOR\"|" \
+        -e "s|^LOGO=.*$|LOGO=$KEDRA_LOGO|"
+
+    # add missing ID_LIKE=
+    if ! grep -q "^ID_LIKE=" "$os_release" && grep -q "^ID=" "$os_release"; then
+        sed -i "$os_release" -e "/^ID=/a \\ID_LIKE=$KEDRA_ID_LIKE"
+    fi
+
+    # Optional keys, dropped while the Kedra domains are undecided.
+    set_release_key "$os_release" HOME_URL "$KEDRA_HOME_URL"
+    set_release_key "$os_release" DOCUMENTATION_URL "$KEDRA_DOCUMENTATION_URL"
+    set_release_key "$os_release" SUPPORT_URL "$KEDRA_SUPPORT_URL"
+    set_release_key "$os_release" BUG_REPORT_URL "$KEDRA_BUG_REPORT_URL"
+    set_release_key "$os_release" PRIVACY_POLICY_URL "$KEDRA_PRIVACY_POLICY_URL"
+}
+
+update_issues() {
+    # Current filesystem versions render \S{PRETTY_NAME} here, so this is a
+    # no-op on them; older or already branded variants carry a literal distro
+    # name, which is normalized to Kedra (upstream Arch and CachyOS alike).
+    sed -i \
+        -e "s|CachyOS Linux|$KEDRA_NAME|g" \
+        -e "s|CachyOS|$KEDRA_NAME|g" \
+        -e "s|Arch Linux|$KEDRA_NAME|g" \
+        /etc/issue /usr/share/factory/etc/issue
+}
+
+case "$1" in
+    # The filesystem package owns /etc/issue as well as /usr/lib/os-release,
+    # so its trigger has to re-apply both.
+    os-release) update_os_release; update_issues ;;
+    lsb-release) update_lsb_release ;;
+    *)
+        update_os_release
+        update_lsb_release
+        update_issues
+        ;;
+esac

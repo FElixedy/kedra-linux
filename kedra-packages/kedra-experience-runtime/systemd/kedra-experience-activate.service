@@ -1,0 +1,69 @@
+[Unit]
+Description=Apply the Kedra Experience to this session
+Documentation=file:///usr/share/doc/kedra-experience-runtime/kedra-experience-runtime.md
+
+# Runs inside the user's graphical session, which is the only place the work is
+# possible at all. The one managed resource Kedra has -- the Super+Enter
+# terminal shortcut -- is a per-path instance of a relocatable GSettings schema
+# plus membership in a list, so writing it means writing this user's dconf
+# through dconf-service over this user's session bus. There is no root service,
+# no chroot and no pacman hook that can do that correctly, which is why
+# installation only records the choice and this enacts it.
+#
+# After, not Requires: if the graphical session never comes up there is nothing
+# to configure, and a desktop that failed to start should not additionally
+# report this unit as broken.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+# NO STATE, NO ACTION -- enforced here as well as in the command.
+#
+# %S is $XDG_STATE_HOME. A user who never chose a Kedra profile has no state
+# file, the condition fails, and the unit does not run at all: systemd records it
+# as skipped rather than started. That is the Vanilla guarantee expressed at the
+# earliest possible point, and it is keyed on the user's own state rather than on
+# which packages happen to be installed -- a system can carry this runtime for
+# any number of reasons, and none of them is consent to reconfigure a desktop.
+ConditionPathExists=%S/kedra/experience-state.toml
+
+[Service]
+Type=oneshot
+
+# The whole production surface this unit is allowed to reach. `apply` writes
+# only `policy = "managed"` resources, only where the ownership model permits,
+# and only once the conflict gate has confirmed the accelerator is free. There
+# is deliberately no --operation switch to widen it with, and `unmanage` -- the
+# supported way out -- is a deliberate act by a person, never a login.
+ExecStart=/usr/bin/kedra-experience apply --format json
+
+# Exit 3 means a managed resource is held by somebody else: the user already has
+# Super+Enter bound to something of their own, so Kedra asked, was told no, and
+# correctly left it alone. The desktop is in exactly the state the rules say it
+# should be in, so treating that as a failed unit would put a permanent red mark
+# on a session whose only fault is that its owner got there first.
+SuccessExitStatus=3
+
+# Cheap and idempotent, so it may run at every login: a run that finds
+# everything already correct performs no write and consumes no generation.
+RemainAfterExit=no
+
+# It configures one optional feature. Nothing else in the session depends on it,
+# and a user whose desktop is otherwise fine must keep a usable desktop even if
+# this fails -- so it never restarts, never blocks, and gives up quickly.
+Restart=no
+TimeoutStartSec=60
+
+# Deliberately close to unsandboxed, and that is a decision rather than an
+# omission. This runs as the user, doing something the user could do by hand in
+# GNOME Settings, so a sandbox buys very little; meanwhile the work depends on
+# reaching the session bus and dconf-service, and every filesystem restriction
+# strong enough to be worth adding (ProtectSystem=strict, ProtectHome) is strong
+# enough to break that. It would break it *quietly* -- the shortcut would simply
+# never appear -- which is the worst failure this feature has.
+#
+# NoNewPrivileges is kept because it costs nothing and is trivially true here:
+# nothing in this path ever needs to escalate.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

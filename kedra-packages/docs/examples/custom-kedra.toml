@@ -1,0 +1,48 @@
+# EXAMPLE ONLY — NOT INSTALLED, NOT PACKAGE DATA.
+#
+# This file documents the shape a "Custom Kedra Experience" takes. It is
+# validated by tools/validate-experience.py so the shape cannot silently rot,
+# but it is deliberately outside kedra-experience/data/ because a real custom
+# preset is MUTABLE USER STATE. Where that state lives is a later task's
+# decision; it will not be under /usr/share/kedra/.
+#
+# The point of `kind = "derived"`: a custom preset stores a pointer to its base
+# plus the deltas. It never clones the Kedra preset's module list. When a later
+# Kedra release adds a module, systems on a custom preset inherit it, because
+# there is no stale copy to go out of date.
+
+schema_version = 6
+
+[preset]
+id = "custom"
+name = "Custom Kedra Experience"
+description = "Kedra Experience with user-selected module overrides."
+version = "0.1.0"
+
+kind = "derived"
+base_preset = "kedra"
+
+user_selectable = true
+
+# Inherited from the base preset. A derived preset may not contradict its base
+# on this flag — deriving from Vanilla to switch the layer on is not a custom
+# Kedra, it is Kedra.
+applies_experience_layer = true
+
+# Only deltas. Anything absent resolves to whatever `kedra` says at the time of
+# resolution, not at the time this file was written.
+[[preset.module_overrides]]
+id = "terminal"
+enabled = false
+
+[[preset.module_overrides]]
+id = "extras"
+enabled = true
+
+# An override may also pin presentation choices within a module once modules
+# expose them. The key is reserved and unused in this task; nothing below the
+# module level is defined yet.
+[[preset.module_overrides]]
+id = "appearance"
+enabled = true
+# presentation = "..."

@@ -1,0 +1,22 @@
+# Template for a throwaway package used by run-tests.sh to exercise the signed
+# upgrade path (repository revision N -> N+1) and the immutable-identity rule.
+# @PKGNAME@, @PKGREL@ and @PAYLOAD@ are substituted by the test harness.
+#
+# @PAYLOAD@ exists so the harness can build two packages with the SAME pacman
+# identity and DIFFERENT bytes, which is the case kedra-repo-publish must refuse.
+#
+# This is NOT a Kedra release artifact. It installs a single marker file under
+# /usr/share and is never published to a production repository.
+
+pkgname=@PKGNAME@
+pkgver=1.0
+pkgrel=@PKGREL@
+pkgdesc='Kedra repository self-test package (not a release artifact)'
+arch=('any')
+license=('GPL-3.0-or-later')
+
+package() {
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/$pkgname/revision" <<-EOF
+	$pkgname $pkgver-$pkgrel
+	EOF
+}

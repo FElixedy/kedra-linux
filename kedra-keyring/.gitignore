@@ -1,0 +1,14 @@
+# build artifacts
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+
+# Private key material must never reach this tree. These patterns are a
+# backstop, not the mechanism: secret keys live in $KEDRA_SIGNING_GNUPGHOME,
+# outside every git working tree. Only kedra.gpg (public export) is tracked.
+*.gpg-secret
+secring*
+*.key
+*.asc
+private-keys-v1.d/

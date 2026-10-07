@@ -1,0 +1,34 @@
+# Kedra Experience — root descriptor.
+#
+# Installed to /usr/share/kedra/experience/experience.toml
+#
+# This file is package-owned, read-only system data. It describes the layout of
+# the Experience data tree and pins the schema every manifest below it must
+# declare. It holds NO user state and NO GNOME configuration.
+
+schema_version = 6
+
+[experience]
+# Layout version of the data tree itself (directory names, discovery rules).
+# Independent of schema_version so the tree can be rearranged without forcing a
+# rewrite of every manifest, and vice versa.
+layout_version = 1
+
+# Serialization format of every manifest in this tree.
+data_format = "toml"
+
+# Directories scanned for manifests, relative to this file. Every *.toml in
+# these directories is a manifest; there is no index file to keep in sync.
+presets_dir = "presets"
+modules_dir = "modules"
+
+# Preset selected when nothing else has been chosen. Must name a preset that
+# exists in presets_dir.
+default_preset = "vanilla"
+
+# Highest schema_version this data tree is known to be readable as. Tooling
+# that understands a lower version must refuse rather than guess.
+min_reader_schema = 2
+
+# Mutable per-user state is NOT here and never will be. It lives under
+# $XDG_STATE_HOME/kedra/ — see docs/kedra-experience.md.

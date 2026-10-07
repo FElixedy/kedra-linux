@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# Populate the target system's pacman keyring with the Kedra trust root.
+#
+# Paths are relative because libalpm runs install scriptlets chrooted into the
+# installation root -- this is what makes the package usable from pacstrap /
+# Calamares against a target root that is not `/`.
+
+populate_kedra() {
+	if usr/bin/pacman-key -l >/dev/null 2>&1; then
+		usr/bin/pacman-key --populate kedra
+	fi
+}
+
+post_install() {
+	if [ -x usr/bin/pacman-key ]; then
+		populate_kedra
+	fi
+}
+
+post_upgrade() {
+	populate_kedra
+}

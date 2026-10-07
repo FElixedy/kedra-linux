@@ -1,0 +1,73 @@
+# Kedra Experience module: integration
+#
+# ARCHITECTURE DEFINITION ONLY.
+#
+# This module is the seam between the Experience layer and the rest of the
+# distribution (branding provider, Kedra tooling). It declares integration
+# points; it does not implement them.
+
+schema_version = 6
+
+[module]
+id = "integration"
+name = "Kedra Integration"
+description = "Distribution integration points: branding provider hand-off and Kedra tooling discovery."
+# 0.3.0: "Kedra tooling discovery" acquired its first real content -- the two
+# packages that put the Experience metadata and the resolver on the target.
+version = "0.3.0"
+tier = "core"
+user_selectable = false
+introduced_in = "0.1.0"
+
+# No relationship to `desktop`. This module is the seam between the Experience
+# layer and the rest of the distribution -- a branding provider hand-off and
+# Kedra tooling discovery. Both are meaningful with or without Kedra's workspace
+# topology, and neither reads a Desktop setting.
+requires = []
+conflicts = []
+
+# Setting declarations (schema 3). Empty: no real GNOME values ship yet.
+settings = []
+
+# Migration records (schema 3). Empty until a setting evolves.
+migrations = []
+
+# The Experience layer's own delivery, declared here rather than assumed.
+#
+# WHY THESE TWO ARE IN A MODULE AND NOT IN THE INSTALLER
+# -----------------------------------------------------
+# Until 0.3.0 nothing required them, so the package set the resolver computed
+# for the `kedra` preset did not include the manifests the resolver itself
+# reads, nor the code that reads them. Anything that installed exactly what the
+# resolver asked for produced a target with Kedra's GSettings defaults and no
+# way to answer "which profile is this?".
+#
+# The obvious repair -- teach the installer to add them whenever it applies the
+# Experience layer -- would put a package name in Calamares, which is precisely
+# the duplication this architecture exists to avoid. Declaring them here keeps
+# the answer in the manifests: they follow `integration`, `integration` is a
+# core module the `kedra` preset enables, and Vanilla resolves no modules at
+# all, so it gets neither. A Custom profile derived from Kedra keeps them,
+# because `integration` is `user_selectable = false` and is not on offer.
+#
+# Self-reference is not circularity. Resolution runs from whichever tree the
+# caller already has -- the live medium's during installation -- and produces
+# "the target needs this package". A package manager requiring itself to be
+# installed on the system it manages is the same ordinary shape.
+[[module.packages]]
+name = "kedra-experience"
+relation = "required"
+reason = "Owns /usr/share/kedra/experience, the manifest tree every Kedra profile decision is read from."
+
+[[module.packages]]
+name = "kedra-experience-runtime"
+relation = "required"
+reason = "Installs the resolver and the read-only kedra-experience command that answer profile questions on the target."
+
+# Replaceable branding provider. Named as a virtual provider so any package can
+# satisfy it. No colours, assets or naming assumptions are encoded here.
+[[module.packages]]
+name = "kedra-branding"
+relation = "optional"
+reason = "Replaceable branding provider; the Experience layer must work without it."
+provides = "kedra-branding-provider"

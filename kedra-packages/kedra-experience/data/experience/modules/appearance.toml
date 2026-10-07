@@ -1,0 +1,46 @@
+# Kedra Experience module: appearance
+#
+# ARCHITECTURE DEFINITION ONLY. No colours, no theme names, no wallpapers, no
+# logo or mascot assets. Branding is developed separately; this module only
+# declares that a branding provider is a replaceable integration point.
+
+schema_version = 6
+
+[module]
+id = "appearance"
+name = "Kedra Appearance"
+description = "Visual presentation layer: theme selection, icon set, fonts and wallpaper sourcing."
+# Bumped for the schema 3 settings/migrations record format.
+version = "0.2.0"
+tier = "recommended"
+user_selectable = true
+introduced_in = "0.1.0"
+
+# No relationship to `desktop` at all, hard or advisory. Appearance selects a
+# theme, an icon set, fonts and a wallpaper source; Desktop owns workspace
+# topology and shell behaviour. Neither reads the other's settings and neither
+# shares a package, so the `requires = ["desktop"]` this module carried until
+# schema 4 described nothing that was ever true -- it made switching off Desktop
+# look like misconfiguration.
+requires = []
+conflicts = []
+
+# Setting declarations (schema 3). Empty: no real GNOME values ship yet.
+settings = []
+
+# Migration records (schema 3). Empty until a setting evolves.
+migrations = []
+
+[[module.packages]]
+name = "gnome-themes-extra"
+relation = "recommended"
+reason = "Provides the theme variants the appearance layer selects between."
+
+# Branding is a replaceable provider, not a hard dependency, and carries no
+# assumptions about what it contains. Nothing here names a colour, logo or
+# mascot.
+[[module.packages]]
+name = "kedra-branding"
+relation = "optional"
+reason = "Replaceable branding provider. Appearance must remain functional without it."
+provides = "kedra-branding-provider"

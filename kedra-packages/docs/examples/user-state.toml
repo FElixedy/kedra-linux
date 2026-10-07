@@ -1,0 +1,94 @@
+# EXAMPLE ONLY — NOT INSTALLED, NOT PACKAGE DATA.
+#
+# This is what one user's Kedra Experience state looks like. In reality it
+# lives at:
+#
+#     $XDG_STATE_HOME/kedra/experience-state.toml
+#     (default: ~/.local/state/kedra/experience-state.toml)
+#
+# It is mutable, user-owned and machine-local. It is NOT distributable profile
+# metadata and must never be shipped in a package. It is validated in CI and by
+# the test suite so this example cannot drift from the model.
+#
+# This file is also the real "Custom Kedra Experience": a base preset plus
+# deltas. Note that only two overrides are stored even though the resolved
+# experience covers all seven modules — nothing is cloned or snapshotted. When
+# a future Kedra release adds a module, this user picks it up automatically.
+
+state_schema_version = 3
+
+# ---------------------------------------------------------------------------
+# What the user chose.
+# ---------------------------------------------------------------------------
+[selection]
+base_preset = "kedra"
+
+[[selection.module_overrides]]
+id = "extensions"
+enabled = false
+
+[[selection.module_overrides]]
+id = "terminal"
+enabled = false
+
+# ---------------------------------------------------------------------------
+# What Kedra last applied. Absent until the first successful apply.
+#
+# `generation` is a plain monotonic counter, bumped once per successful apply.
+# Per-module generations record when each module was last actually changed, so
+# a module that was already up to date keeps its older generation.
+# ---------------------------------------------------------------------------
+[applied]
+generation = 2
+preset_id = "kedra"
+preset_version = "0.1.0"
+experience_schema_version = 3
+applied_at = "2026-08-14T12:00:00Z"
+
+[[applied.modules]]
+id = "appearance"
+version = "0.2.0"
+active = true
+generation = 1
+
+[[applied.modules]]
+id = "desktop"
+version = "0.4.0"
+active = true
+generation = 1
+
+[[applied.modules]]
+id = "extensions"
+version = "0.2.0"
+active = false
+generation = 2
+
+[[applied.modules]]
+id = "extras"
+version = "0.3.0"
+active = false
+generation = 1
+
+[[applied.modules]]
+id = "integration"
+version = "0.3.0"
+active = true
+generation = 1
+
+[[applied.modules]]
+id = "terminal"
+version = "0.5.0"
+active = false
+generation = 2
+
+[[applied.modules]]
+id = "workflow"
+version = "0.3.0"
+active = true
+generation = 1
+
+# Reserved for a future GNOME adapter: individually managed values, so Kedra
+# can tell what it set from what the user has since changed. Must stay empty
+# until that adapter exists — no GNOME value is read or written today.
+#
+# [[applied.managed_values]]

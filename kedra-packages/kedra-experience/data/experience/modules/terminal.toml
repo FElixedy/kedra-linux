@@ -1,0 +1,214 @@
+# Kedra Experience module: terminal
+#
+# Kedra Terminal v1 -- the terminal *application contract*.
+#
+# What this module owns: which terminal application the Kedra experience is,
+# and therefore which package a profile with Terminal enabled must install.
+# That is the whole of v1, and it is deliberately small.
+#
+# What this module does NOT own, and must not acquire by accident:
+#
+#   * the login shell. Kedra Terminal never runs chsh and never edits a
+#     fish/bash/zsh configuration. A terminal emulator and a shell are separate
+#     products, and a distribution that conflates them cannot be uninstalled
+#     from a user's muscle memory.
+#   * the prompt. No Starship, no prompt framework, no rc content.
+#   * user dotfiles. Nothing here writes into $HOME at all.
+#   * shell aliases. CachyOS's fish configuration is the user's, not Kedra's;
+#     it is neither copied, forked nor replaced.
+#   * the terminal font. GNOME Console follows the system monospace font by
+#     default (use-system-font = true), which is the correct behaviour: a
+#     terminal that picks its own font fights the desktop's font settings.
+#     No Nerd Font is pulled in.
+#   * colours, palette and theme. Those belong to the appearance layer -- see
+#     the works_best_with note below.
+#   * x-scheme-handler/terminal, default-application registration, or any other
+#     MIME/handler claim.
+#
+# Black Box, foot, Ptyxis and anything else remain perfectly good choices for a
+# user. None of them is a Kedra dependency, and the contract below is the one
+# place a future terminal selector would edit to change the answer.
+
+schema_version = 6
+
+[module]
+id = "terminal"
+name = "Kedra Terminal"
+description = "The Kedra terminal: which terminal emulator the Kedra experience uses, and the shortcut that opens it."
+# Bumped for Super+Enter: the terminal launch shortcut, and with it Kedra's
+# first `policy = "managed"` declaration.
+version = "0.5.0"
+tier = "optional"
+user_selectable = true
+introduced_in = "0.1.0"
+
+# No module-to-module relationship of either strength.
+#
+# `works_best_with = appearance` was declared here until Terminal v1 and has
+# been removed. The rule for an advisory relationship is that separating the two
+# must produce a *meaningful degraded experience*, and after the v1 scope review
+# it does not: Terminal declares which terminal application Kedra uses, and that
+# is exactly as true, as complete and as functional with the appearance layer
+# switched off. Colours and theme are Appearance's to own, and Appearance ships
+# no terminal-facing value today, so the advisory pointed at nothing a user
+# could observe. An advisory with no concrete consequence is noise in a
+# selection UI, and the dependency model exists to keep honest customisation
+# from looking like misconfiguration.
+#
+# If Appearance later ships a terminal palette that Terminal is designed
+# around, the relationship earns its place then -- declared with the evidence in
+# hand, and pointing at something a user would actually notice losing.
+requires = []
+conflicts = []
+
+# Setting declarations (schema 3). Intentionally empty in v1 -- this is a
+# reviewed outcome, not an omission.
+#
+# Every key in org.gnome.Console was inspected against the installed schema
+# (gnome-console 50.0) and judged individually. Kedra ships an override only
+# where upstream is wrong for a general user, and upstream is not:
+#
+#   scrollback-lines      10000 already, which is a useful capacity and the
+#                         same figure GNOME Terminal has defaulted to for
+#                         years. Re-declaring it would add a Kedra file whose
+#                         removal changes nothing.
+#   audible-bell          true upstream. The bell is an alert channel with an
+#                         accessibility dimension, already gated by GNOME's own
+#                         sound settings and toggleable in Console's menu.
+#                         Silencing it distribution-wide is a taste change, not
+#                         a fix.
+#   visual-bell           true upstream, and the accessible counterpart of the
+#                         above.
+#   use-system-font       true upstream, i.e. follow the desktop's monospace
+#                         font. Exactly what Kedra wants.
+#   theme, livery,
+#   custom-liveries,
+#   transparency          appearance-owned. Terminal must not pre-empt the
+#                         palette decision.
+#   custom-font,
+#   font-scale            personal presentation, not a distribution default.
+#   shell                 the login shell is explicitly not Kedra Terminal's.
+#   last-window-size,
+#   last-window-maximised,
+#   restore-window-size   session state and window geometry, never a vendor
+#                         default.
+#   ignore-scrollback-limit,
+#   software-flow-control expert toggles with correct-by-default upstream
+#                         values.
+#
+# Consequences of shipping nothing here, all of them intended: this module
+# renders no GSettings vendor override, so there is still no
+# `kedra-experience-terminal` package and none is created for symmetry, and no
+# int64 ('x') support was added to the value vocabulary -- scrollback-lines is
+# the only 'x' key in sight and Kedra does not ship it.
+#
+# Super+Enter is NOT here. It is not an org.gnome.Console preference at all: it
+# is a GNOME custom keybinding, which is four coordinated values rather than
+# one, and it is declared as `[[module.shortcuts]]` at the bottom of this file.
+# See docs/kedra-terminal.md.
+settings = []
+
+# Migration records (schema 3). Empty until a setting evolves.
+migrations = []
+
+# ---------------------------------------------------------------------------
+# The terminal application contract (schema 5)
+# ---------------------------------------------------------------------------
+#
+# "The Kedra terminal is GNOME Console", stated once, declaratively, in the
+# form other parts of Kedra can consume.
+#
+# A desktop-file ID rather than `kgx`, `/usr/bin/kgx` or a `flatpak run` line:
+# the ID is what GAppInfo, GNOME Settings and `gio launch` speak, it survives a
+# native/Flatpak switch or a rename of the binary underneath it, and as data it
+# cannot carry arguments or a shell fragment. A consumer that needs to launch
+# the application resolves the ID through GAppInfo at that point.
+#
+# This is the declaration the Super+Enter shortcut is waiting on, and the one
+# place a future terminal selector would change. Selecting a different terminal
+# is an edit to these three lines plus the package relation below -- no new
+# module, no schema change, no caller learning a path.
+#
+# It is deliberately not a `module.settings` entry: nothing writes it into
+# dconf, nothing reads it back out, and it has no user value to revert.
+[[module.applications]]
+role = "terminal"
+desktop_id = "org.gnome.Console.desktop"
+package = "gnome-console"
+reason = "GNOME Console is the Kedra terminal: GNOME's own terminal for GNOME 50, already part of the GNOME experience Kedra builds on, and the application the Kedra terminal keybinding will launch."
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+#
+# Required, not recommended, and that is the substance of Terminal v1's package
+# semantics: a module that names GNOME Console as *the* Kedra terminal cannot
+# also treat its absence as a mild degradation. An enabled Terminal module means
+# gnome-console is installed; the module disabled -- or Vanilla, which applies
+# no module at all -- means Kedra Experience asks for it not at all. The
+# manifest validator cross-checks that the application contract above names a
+# package declared required here, so the two cannot drift apart.
+#
+# A `gnome-terminal` conditional relation was declared here until Terminal v1
+# and has been removed. It configured nothing -- this module has never shipped a
+# setting -- so it promised to "configure gnome-terminal if you already have it"
+# while doing nothing of the kind. A compatibility placeholder with no real
+# purpose is worse than no relation at all: it is metadata a reader has to
+# disprove.
+[[module.packages]]
+name = "gnome-console"
+relation = "required"
+reason = "The Kedra terminal application. This module's terminal contract names org.gnome.Console.desktop, which this package provides."
+
+
+# ---------------------------------------------------------------------------
+# Super+Enter -- open the Kedra terminal (schema 6)
+# ---------------------------------------------------------------------------
+#
+# Kedra's first and, so far, only `policy = "managed"` declaration: the first
+# value Kedra actively writes into a user's dconf, and therefore the first that
+# can ever need reverting.
+#
+# It has to be managed. GNOME 50 has no terminal-launch keybinding key --
+# org.gnome.desktop.default-applications.terminal exists and is marked
+# "DEPRECATED: This key is deprecated and ignored" -- so the only way to bind
+# Super+Enter is a GNOME *custom keybinding*: an instance of the relocatable
+# schema org.gnome.settings-daemon.plugins.media-keys.custom-keybinding at a
+# per-shortcut dconf path, plus that path's presence in the media-keys
+# `custom-keybindings` list. A vendor override addresses a schema by ID and
+# cannot name a path, and a section for a relocatable schema applies to *every*
+# instance at every path -- which for a custom keybinding would change the
+# fallback binding of shortcuts the user created themselves. So the vendor-
+# default route is not merely unavailable, it is wrong.
+#
+# One declaration, not four settings. A custom shortcut is a composite
+# resource: the three child values and the list membership only mean anything
+# together, they have to be written in an order that never leaves a registered
+# shortcut half-configured, and a user who edits one of them has edited the
+# shortcut. Kedra expands this into four settings -- `terminal-launch-shortcut-name`,
+# `-command`, `-binding` and `-registration` -- and they are ordinary managed
+# settings from there on.
+#
+# `path` is persistent identity. Every ownership record a user will ever have
+# for this shortcut refers to it, so changing it later is a migration, not an
+# edit. It is fixed text carrying no user or machine data, and the `kedra-`
+# segment cannot collide with the `custom0/`, `custom1/`, ... paths GNOME
+# Settings generates for a user's own shortcuts.
+#
+# `command` is a typed reference, not a command. It names the application
+# *role* this module already fills above, and Kedra derives
+# `gapplication launch org.gnome.Console` from that contract. There is no
+# interpolation and no expression language: the only thing this line can say is
+# "whichever application fills the terminal role". Selecting a different
+# terminal is still an edit to the `[[module.applications]]` table alone.
+[[module.shortcuts]]
+id = "terminal-launch-shortcut"
+policy = "managed"
+description = "Open the Kedra terminal with Super+Enter."
+introduced_in = "0.5.0"
+path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/kedra-terminal/"
+name = "Kedra Terminal"
+# The accelerator as GNOME itself spells it -- verified against a shortcut
+# created through GNOME Settings, which writes exactly this text.
+binding = "<Super>Return"
+command = { application_role = "terminal" }

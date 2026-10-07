@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# kedra-branding-images -- regenerate the PLACEHOLDER branding images.
+#
+# Kedra has no final logo. Rather than commit binary artwork whose origin nobody
+# can reconstruct, the three images the branding component needs are generated
+# from this script, so "what is our logo right now" has a readable answer:
+# a wordmark in the Kedra placeholder colours, and nothing else.
+#
+# When real artwork exists it simply replaces the three PNGs and this script is
+# deleted. Nothing in branding.desc depends on how the images were made.
+#
+# Requires: imagemagick, a sans font (Cantarell, from gnome; DejaVu as fallback).
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/../src/branding/kedra"
+
+FG='#5AA9E6'   # Kedra placeholder accent, same value as branding.desc
+FONT=$(fc-match --format='%{file}' 'Cantarell:weight=bold' 2>/dev/null || true)
+[[ -r ${FONT} ]] || FONT=$(fc-match --format='%{file}' 'DejaVu Sans:weight=bold')
+
+msg() { printf '==> %s\n' "$*"; }
+
+# productLogo -- 64x64, shown in the installer sidebar.
+msg "logo.png (64x64)"
+magick -size 64x64 xc:none -font "${FONT}" -fill "${FG}" \
+	-pointsize 52 -gravity center -annotate +0+2 'K' \
+	-strip logo.png
+
+# productIcon -- 128x128, the window icon.
+msg "icon.png (128x128)"
+magick -size 128x128 xc:none -font "${FONT}" -fill "${FG}" \
+	-pointsize 104 -gravity center -annotate +0+4 'K' \
+	-strip icon.png
+
+# productWelcome -- 900x516, the welcome page banner. Transparent so it sits on
+# whatever the Calamares palette is, exactly as upstream's did.
+msg "welcome.png (900x516)"
+magick -size 900x516 xc:none -font "${FONT}" -fill "${FG}" \
+	-pointsize 96 -gravity center -annotate +0-20 'Kedra Linux' \
+	-fill '#8A9199' -pointsize 30 -gravity center -annotate +0+70 'rolling release' \
+	-strip welcome.png
+
+msg "done -- placeholder branding regenerated"
